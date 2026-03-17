@@ -30,7 +30,7 @@ npm run dev
 
 ### 2. 在线demo
 
-(等待更新)
+[MMMimic Studio On DFTServer](https://mstudio.dftserver.top/)
 
 ## 📖 使用指南
 
