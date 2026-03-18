@@ -6,23 +6,29 @@ import { CCDIKSolver } from 'three/examples/jsm/animation/CCDIKSolver.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
 // ==========================================
-// 0. 内置超级 URDF 引擎
+// 0. 内置超级 URDF 引擎 (含 Inertial 解析)
 // ==========================================
 const MOCK_URDF_XML = `
 <robot name="Placeholder_Bot">
-  <link name="base_link" />
+  <link name="base_link">
+    <inertial><mass value="5.0"/><origin xyz="0 0 0" rpy="0 0 0"/></inertial>
+  </link>
   <joint name="Shoulder" type="revolute">
     <parent link="base_link" /><child link="upper_arm" />
     <origin xyz="0 0 0" rpy="0 0 0" /><axis xyz="0 0 1" />
     <limit lower="-1.57" upper="1.57" />
   </joint>
-  <link name="upper_arm" />
+  <link name="upper_arm">
+    <inertial><mass value="2.0"/><origin xyz="0 1 0" rpy="0 0 0"/></inertial>
+  </link>
   <joint name="Elbow" type="revolute">
     <parent link="upper_arm" /><child link="forearm" />
     <origin xyz="0 2 0" rpy="0 0 0" /><axis xyz="0 0 1" />
     <limit lower="-2.5" upper="0" /> 
   </joint>
-  <link name="forearm" />
+  <link name="forearm">
+    <inertial><mass value="1.0"/><origin xyz="0 1.5 0" rpy="0 0 0"/></inertial>
+  </link>
 </robot>
 `;
 
@@ -46,7 +52,16 @@ function parseURDF(xmlString) {
         visuals.push({ filename, xyz, rpy, scale });
       }
     });
-    robot.links[name] = { name, visuals };
+
+    let mass = 0; let comOrigin = [0, 0, 0];
+    const inertial = link.querySelector(':scope > inertial');
+    if (inertial) {
+        const massNode = inertial.querySelector('mass');
+        if (massNode && massNode.getAttribute('value')) mass = parseFloat(massNode.getAttribute('value'));
+        const originNode = inertial.querySelector('origin');
+        if (originNode && originNode.getAttribute('xyz')) comOrigin = originNode.getAttribute('xyz').split(' ').map(Number);
+    }
+    robot.links[name] = { name, visuals, mass, comOrigin };
   });
 
   Array.from(xmlDoc.getElementsByTagName('joint')).forEach(j => {
@@ -63,9 +78,7 @@ function parseURDF(xmlString) {
     const limitLower = limitElem && limitElem.getAttribute('lower') ? parseFloat(limitElem.getAttribute('lower')) : -Math.PI;
     const limitUpper = limitElem && limitElem.getAttribute('upper') ? parseFloat(limitElem.getAttribute('upper')) : Math.PI;
 
-    if (child) {
-        robot.joints[child] = { name, type, parent, child, xyz, rpy, axis, limitLower, limitUpper };
-    }
+    if (child) robot.joints[child] = { name, type, parent, child, xyz, rpy, axis, limitLower, limitUpper };
   });
 
   const isChild = new Set(Object.keys(robot.joints));
@@ -221,7 +234,7 @@ const CurveEditor = ({ curve, onChange, disabled, theme }) => {
 };
 
 // ==========================================
-// 3. 高性能时间轴组件 (边界安全版)
+// 3. 高性能时间轴组件 (数据可视化版)
 // ==========================================
 const Timeline = ({ 
   robotData, boneNames, totalFrames, setTotalFrames,
@@ -236,11 +249,12 @@ const Timeline = ({
   const keyframeCanvasRef = useRef(null); 
   const [rangeStart, setRangeStart] = useState(0); 
   const [rangeEnd, setRangeEnd] = useState(60);
+  const [angleUnit, setAngleUnit] = useState('degree'); // 🔴 新增：弧度/角度切换状态
 
   useEffect(() => {
     if (isPlaying && scrollRef.current) {
       const container = scrollRef.current; const targetX = currentFrame * 20; const viewWidth = container.clientWidth; const currentScroll = container.scrollLeft;
-      if (targetX > currentScroll + viewWidth - 140) container.scrollTo({ left: targetX - viewWidth / 2, behavior: 'auto' });
+      if (targetX > currentScroll + viewWidth - 170) container.scrollTo({ left: targetX - viewWidth / 2, behavior: 'auto' });
       else if (targetX < currentScroll) container.scrollTo({ left: Math.max(0, targetX - 40), behavior: 'auto' });
     }
   }, [currentFrame, isPlaying]);
@@ -318,9 +332,9 @@ const Timeline = ({
   const getCoordinatesFromEvent = (e) => {
       const rect = scrollRef.current.getBoundingClientRect();
       const mouseX = e.clientX - rect.left; const mouseY = e.clientY - rect.top;
-      if (mouseX < 150 || mouseY < 24) return null; 
+      if (mouseX < 180 || mouseY < 24) return null; // 🔴 将点击拦截区域拓宽为 180px
       const sL = scrollRef.current.scrollLeft; const sT = scrollRef.current.scrollTop;
-      const x = mouseX - 150 + sL; const y = mouseY - 24 + sT;
+      const x = mouseX - 180 + sL; const y = mouseY - 24 + sT;
       const frame = Math.max(0, Math.min(totalFrames, Math.floor(x / 20)));
       const boneIdx = Math.max(0, Math.min(boneNames.length - 1, Math.floor(y / 24)));
       return { frame, boneIdx };
@@ -341,6 +355,9 @@ const Timeline = ({
   };
   const handleScrollToCurrent = () => { if (scrollRef.current) scrollRef.current.scrollTo({ left: Math.max(0, currentFrame * 20 - 50), behavior: 'smooth' }); };
 
+  // 🔴 实时物理状态提取：为每一帧在表格旁计算并显示当前角度数据
+  const currentState = robotData ? evaluateFrame(currentFrame, keyframes, robotData) : {};
+
   const bgGrid = `repeating-linear-gradient(to right, var(--border) 0px, transparent 1px, transparent 20px)`;
 
   return (
@@ -354,12 +371,22 @@ const Timeline = ({
       </div>
       
       <div className="flex-1 relative overflow-hidden flex flex-col bg-[var(--bg-main)]">
-         <canvas ref={keyframeCanvasRef} className="absolute pointer-events-none z-20" style={{ left: 150, top: 24, width: 'calc(100% - 168px)', height: 'calc(100% - 42px)' }} />
+         {/* 🔴 扩展了Canvas和背景网格起始点至180px */}
+         <canvas ref={keyframeCanvasRef} className="absolute pointer-events-none z-20" style={{ left: 180, top: 24, width: 'calc(100% - 198px)', height: 'calc(100% - 42px)' }} />
 
          <div ref={scrollRef} className="flex-1 overflow-auto relative select-none" onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}>
-            <div style={{ width: `${totalFrames * 20 + 150}px`, height: `${boneNames.length * 24 + 24}px` }} className="relative">
+            <div style={{ width: `${totalFrames * 20 + 180}px`, height: `${boneNames.length * 24 + 24}px` }} className="relative">
                <div className="sticky top-0 h-[24px] flex z-40 bg-[var(--bg-header)] border-b border-[var(--border)]">
-                  <div className="sticky left-0 w-[150px] bg-[var(--bg-header)] z-50 border-r border-[var(--border)] flex items-center pl-2 text-xs font-bold text-[var(--text-main)]" onPointerDown={e=>e.stopPropagation()}>节点 (Links)</div>
+                  <div className="sticky left-0 w-[180px] bg-[var(--bg-header)] z-50 border-r border-[var(--border)] flex justify-between items-center px-2 text-xs font-bold text-[var(--text-main)]" onPointerDown={e=>e.stopPropagation()}>
+                      <span>节点 (Links)</span>
+                      <span 
+                          className="text-[9px] text-[var(--text-muted)] font-normal cursor-pointer hover:text-[var(--text-highlight)] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] transition-colors" 
+                          onClick={() => setAngleUnit(u => u === 'degree' ? 'radian' : 'degree')}
+                          title="点击切换 角度(°)/弧度(rad)"
+                      >
+                          数值({angleUnit === 'degree' ? '°' : 'rad'})
+                      </span>
+                  </div>
                   <div className="flex-1 relative" style={{ backgroundImage: `repeating-linear-gradient(to right, transparent, transparent 19px, var(--border) 19px, var(--border) 20px)` }}>
                      {Array.from({length: Math.floor(totalFrames/5) + 1}).map((_, i) => (
                        <div key={i} style={{ position:'absolute', left: i*5*20, width: 20, textAlign: 'center', lineHeight: '24px' }}>
@@ -368,20 +395,48 @@ const Timeline = ({
                      ))}
                   </div>
                </div>
-               <div className="relative" style={{ backgroundImage: bgGrid, backgroundPosition: '150px 0', backgroundSize: '20px 100%' }}>
+               <div className="relative" style={{ backgroundImage: bgGrid, backgroundPosition: '180px 0', backgroundSize: '20px 100%' }}>
                   {boneNames.map((bone, boneIdx) => {
                      const isRoot = robotData && bone === robotData.rootLink;
                      const isSelected = selectedBones.includes(bone);
+                     
+                     // 🔴 解析计算当前显示的数据
+                     let displayVal = "-";
+                     const jointState = currentState[bone];
+                     if (jointState) {
+                         if (isRoot) {
+                             displayVal = `${jointState.p[0].toFixed(2)}, ${jointState.p[1].toFixed(2)}, ${jointState.p[2].toFixed(2)}`;
+                         } else if (robotData.joints[bone]) {
+                             const jointData = robotData.joints[bone];
+                             const qTotal = new THREE.Quaternion().fromArray(jointState.q);
+                             const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
+                             const qJoint = qOrigin.clone().invert().multiply(qTotal);
+                             const axisVec = new THREE.Vector3(...jointData.axis).normalize();
+                             const sinHalfTheta = qJoint.x * axisVec.x + qJoint.y * axisVec.y + qJoint.z * axisVec.z;
+                             const cosHalfTheta = qJoint.w;
+                             let angle = 2 * Math.atan2(sinHalfTheta, cosHalfTheta);
+                             while (angle > Math.PI) angle -= 2 * Math.PI;
+                             while (angle < -Math.PI) angle += 2 * Math.PI;
+                             
+                             // 🔴 智能格式化：根据当前选中的单位进行输出
+                             displayVal = angleUnit === 'degree' 
+                                 ? (angle * 180 / Math.PI).toFixed(1) + '°' 
+                                 : angle.toFixed(3) + ' rad';
+                         }
+                     }
+
                      return (
                        <div key={bone} style={{backgroundColor: isSelected ? 'var(--bg-selected)' : 'transparent'}} className={`flex h-[24px] border-b border-[var(--border)] hover:bg-[var(--bg-hover)] transition-colors`}>
-                          <div className={`sticky left-0 w-[150px] z-30 p-1 font-mono text-[10px] border-r border-[var(--border)] overflow-hidden text-ellipsis whitespace-nowrap cursor-pointer ${isSelected ? 'bg-[var(--accent)] text-white' : (isRoot ? 'text-[#e55353] font-bold' : 'text-[var(--text-main)] bg-[var(--bg-panel)]')}`} onPointerDown={(e) => { e.stopPropagation(); onSelectBone([bone]); }}>
-                             {bone} {isRoot ? '(Base)' : ''}
+                          <div className={`sticky left-0 w-[180px] z-30 px-2 py-1 font-mono text-[10px] border-r border-[var(--border)] cursor-pointer flex justify-between items-center ${isSelected ? 'bg-[var(--accent)] text-white' : (isRoot ? 'text-[#e55353] font-bold' : 'text-[var(--text-main)] bg-[var(--bg-panel)]')}`} onPointerDown={(e) => { e.stopPropagation(); onSelectBone([bone]); }}>
+                             <span className="truncate w-[100px]" title={bone}>{bone} {isRoot ? '(Base)' : ''}</span>
+                             {/* 🔴 添加了显示数值的右侧小标签 */}
+                             <span className={`text-[9px] text-right truncate w-[60px] ${isSelected ? 'text-[rgba(255,255,255,0.8)]' : 'text-[var(--accent)] font-bold'}`} title={displayVal}>{displayVal}</span>
                           </div>
                        </div>
                      );
                   })}
-                  <div style={{ position: 'absolute', left: 150 + currentFrame * 20, top: 0, width: 20, height: '100%', backgroundColor: 'rgba(0,122,204,0.2)', pointerEvents: 'none', zIndex: 10, borderLeft: '1px solid rgba(0,122,204,0.8)' }} />
-                  {selectionBox && <div style={{ position: 'absolute', left: 150 + Math.min(selectionBox.startFrame, selectionBox.endFrame) * 20, top: Math.min(selectionBox.startBone, selectionBox.endBone) * 24, width: (Math.abs(selectionBox.endFrame - selectionBox.startFrame) + 1) * 20, height: (Math.abs(selectionBox.endBone - selectionBox.startBone) + 1) * 24, backgroundColor: 'rgba(0,152,255,0.3)', border: '1px solid #0098ff', pointerEvents: 'none', zIndex: 15 }} />}
+                  <div style={{ position: 'absolute', left: 180 + currentFrame * 20, top: 0, width: 20, height: '100%', backgroundColor: 'rgba(0,122,204,0.2)', pointerEvents: 'none', zIndex: 10, borderLeft: '1px solid rgba(0,122,204,0.8)' }} />
+                  {selectionBox && <div style={{ position: 'absolute', left: 180 + Math.min(selectionBox.startFrame, selectionBox.endFrame) * 20, top: Math.min(selectionBox.startBone, selectionBox.endBone) * 24, width: (Math.abs(selectionBox.endFrame - selectionBox.startFrame) + 1) * 20, height: (Math.abs(selectionBox.endBone - selectionBox.startBone) + 1) * 24, backgroundColor: 'rgba(0,152,255,0.3)', border: '1px solid #0098ff', pointerEvents: 'none', zIndex: 15 }} />}
                </div>
             </div>
          </div>
@@ -414,15 +469,16 @@ const Timeline = ({
 };
 
 // ==========================================
-// 4. 支持真实 URDF 物理渲染的 3D 视图引擎
+// 4. 支持真实 URDF 物理渲染的 3D 视图引擎 (含动态质心计算与地标)
 // ==========================================
-const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, keyframes, isPlaying, selectedBones, onSelectBone, robotData, fileMap, theme }, ref) => {
+const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentFrame, keyframes, isPlaying, selectedBones, onSelectBone, robotData, fileMap, theme }, ref) => {
   const containerRef = useRef(null);
   const boxRef = useRef(null); 
 
   const stateRef = useRef({ 
-    mode, selType, space, ikMode, isPlaying, selectedBones,
-    bonesMap: {}, transformControl: null, ikTargetMesh: null, camera: null, orbit: null, scene: null, grid: null
+    mode, selType, space, ikMode, showCoM, isPlaying, selectedBones,
+    bonesMap: {}, transformControl: null, ikTargetMesh: null, camera: null, orbit: null, scene: null, grid: null,
+    comGroup: null, comSphere: null, comLine: null, comGroundMarker: null
   });
 
   useEffect(() => { 
@@ -460,8 +516,8 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
   useEffect(() => { stateRef.current.isPlaying = isPlaying; }, [isPlaying]);
   useEffect(() => { stateRef.current.space = space; if (stateRef.current.transformControl) stateRef.current.transformControl.setSpace(space); }, [space]);
   useEffect(() => { stateRef.current.ikMode = ikMode; }, [ikMode]);
+  useEffect(() => { stateRef.current.showCoM = showCoM; }, [showCoM]);
 
-  // 动态切换明暗场景
   useEffect(() => {
       if (stateRef.current.scene && stateRef.current.grid) {
           stateRef.current.scene.background = new THREE.Color(theme === 'dark' ? 0x222222 : 0xf0f0f0);
@@ -469,7 +525,6 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
       }
   }, [theme]);
 
-  // 🔴 智能反馈：提供将被修改的 IK 骨骼链集合给外部注册
   useImperativeHandle(ref, () => ({
     getAllBoneRotations: () => {
       const res = {};
@@ -495,13 +550,12 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
             const affected = new Set(stateRef.current.selectedBones);
             let current = activeBone.parent;
             
-            // 🔴 智能判定 IK 影响的节点：一旦碰到未被选中的父节点，立即切断！完美解决框选拉扯问题
             while (current && current.type !== 'Group') {
                 if (current.isBone && current.name && current.name !== robotData.rootLink) {
                     const jointData = current.userData.jointData;
                     if (jointData && jointData.type !== 'fixed') {
                         if (stateRef.current.ikMode !== 'global' && !stateRef.current.selectedBones.includes(current.name)) {
-                            break; // 在局部模式下，遇到未选中的父节点立即终止链的追溯
+                            break; 
                         }
                         affected.add(current.name);
                     }
@@ -543,12 +597,54 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
     renderer.setSize(container.clientWidth, container.clientHeight);
     container.appendChild(renderer.domElement);
 
-    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
-    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0); dirLight.position.set(5, 10, 5); scene.add(dirLight);
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
+    hemiLight.position.set(0, 20, 0);
+    scene.add(hemiLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0); 
+    dirLight.position.set(5, 10, 10); 
+    scene.add(dirLight);
+
+    const backLight = new THREE.DirectionalLight(0xffffff, 0.6); 
+    backLight.position.set(-10, 5, -10); 
+    scene.add(backLight);
     
     const grid = new THREE.GridHelper(10, 20, 0x444444, theme === 'dark' ? 0x444444 : 0xcccccc);
     scene.add(grid);
     stateRef.current.grid = grid;
+
+    // ==========================================
+    // 🟢 质心指示器与地面投影靶心
+    // ==========================================
+    const comGroup = new THREE.Group();
+    scene.add(comGroup);
+    
+    const comSphere = new THREE.Mesh(
+        new THREE.SphereGeometry(0.04, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0xff00ff, depthTest: false })
+    );
+    comSphere.renderOrder = 3;
+    comGroup.add(comSphere);
+
+    const lineMat = new THREE.LineDashedMaterial({ color: 0xff00ff, dashSize: 0.05, gapSize: 0.05, depthTest: false });
+    const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+    const comLine = new THREE.Line(lineGeo, lineMat);
+    comLine.renderOrder = 3;
+    comGroup.add(comLine);
+
+    // 🔴 质心地面落点标识圈
+    const comGroundMarker = new THREE.Mesh(
+        new THREE.RingGeometry(0.04, 0.08, 24),
+        new THREE.MeshBasicMaterial({ color: 0xff00ff, side: THREE.DoubleSide, depthTest: false })
+    );
+    comGroundMarker.rotation.x = -Math.PI / 2; // 躺平在地面
+    comGroundMarker.renderOrder = 3;
+    comGroup.add(comGroundMarker);
+
+    stateRef.current.comGroup = comGroup;
+    stateRef.current.comSphere = comSphere;
+    stateRef.current.comLine = comLine;
+    stateRef.current.comGroundMarker = comGroundMarker;
 
     const orbit = new OrbitControls(camera, renderer.domElement);
     orbit.target.set(0, 0.5, 0); orbit.update();
@@ -619,7 +715,9 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
     stateRef.current.bonesMap = bonesMap;
 
     const stlLoader = new STLLoader();
-    const defaultMaterial = new THREE.MeshPhongMaterial({ color: 0x999999, specular: 0x111111, shininess: 50 });
+    const defaultMaterial = new THREE.MeshStandardMaterial({ 
+        color: 0xe0e0e0, roughness: 0.5, metalness: 0.2, side: THREE.DoubleSide 
+    });
     Object.values(robotData.links).forEach(link => {
         const bone = bonesMap[link.name]; if (!bone) return;
         let hasVisual = false;
@@ -778,8 +876,10 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
                const links = [];
                let current = activeBone.parent;
                
-               // 🔴 完美断路器：如果是局部模式，必须被选中的父节点才加入IK连结！否则切断。
-               while(current && current.type !== 'Group') {
+               const maxLinks = stateRef.current.ikMode === 'global' ? 100 : 4;
+               let count = 0;
+               
+               while(current && current.type !== 'Group' && count < maxLinks) {
                    if (current.isBone && current.name && current.name !== robotData.rootLink) {
                        const jointData = current.userData.jointData;
                        if (jointData && jointData.type !== 'fixed') {
@@ -789,6 +889,7 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
                            const idx = bonesArray.indexOf(current);
                            if (idx > -1) {
                                links.push({ index: idx }); 
+                               count++;
                            }
                        }
                    }
@@ -822,6 +923,44 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
             const jointData = bone.userData.jointData;
             if(jointData) clampJoint(bone, jointData);
          });
+      }
+
+      scene.updateMatrixWorld(true);
+
+      if (stateRef.current.showCoM && robotData) {
+          let totalMass = 0;
+          const globalCom = new THREE.Vector3();
+          const tempVec = new THREE.Vector3();
+          
+          Object.values(robotData.links).forEach(linkData => {
+              if (linkData.mass > 0 && stateRef.current.bonesMap[linkData.name]) {
+                  const bone = stateRef.current.bonesMap[linkData.name];
+                  tempVec.set(...linkData.comOrigin);
+                  tempVec.applyMatrix4(bone.matrixWorld);
+                  globalCom.addScaledVector(tempVec, linkData.mass);
+                  totalMass += linkData.mass;
+              }
+          });
+          
+          if (totalMass > 0) {
+              globalCom.divideScalar(totalMass);
+              stateRef.current.comSphere.position.copy(globalCom);
+              
+              const positions = stateRef.current.comLine.geometry.attributes.position.array;
+              positions[0] = globalCom.x; positions[1] = globalCom.y; positions[2] = globalCom.z;
+              positions[3] = globalCom.x; positions[4] = 0;           positions[5] = globalCom.z;
+              stateRef.current.comLine.geometry.attributes.position.needsUpdate = true;
+              stateRef.current.comLine.computeLineDistances();
+              
+              // 🔴 同步更新地面投影标靶的位置
+              stateRef.current.comGroundMarker.position.set(globalCom.x, 0.005, globalCom.z);
+              
+              stateRef.current.comGroup.visible = true;
+          } else {
+              stateRef.current.comGroup.visible = false;
+          }
+      } else if (stateRef.current.comGroup) {
+          stateRef.current.comGroup.visible = false;
       }
 
       renderer.render(scene, camera);
@@ -863,12 +1002,13 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, currentFrame, key
 // 5. 主应用与状态统筹
 // ==========================================
 export default function App() {
-  const [theme, setTheme] = useState('dark'); // 🌞/🌙 主题切换
+  const [theme, setTheme] = useState('dark'); 
 
   const [mode, setMode] = useState('rotate'); 
   const [selType, setSelType] = useState('free'); 
   const [space, setSpace] = useState('local'); 
   const [ikMode, setIkMode] = useState('selected'); 
+  const [showCoM, setShowCoM] = useState(false); 
   
   const [totalFrames, setTotalFrames] = useState(100);
   const [isFramesModalOpen, setIsFramesModalOpen] = useState(false);
@@ -895,7 +1035,6 @@ export default function App() {
   const [isURDFModalOpen, setIsURDFModalOpen] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
 
-  // 动态主题 CSS 变量注入
   const themeStyles = theme === 'dark' ? {
       '--bg-main': '#1e1e1e', '--bg-panel': '#252526', '--bg-header': '#333333', 
       '--border': '#3e3e42', '--text-main': '#cccccc', '--text-muted': '#888888', '--text-highlight': '#ffffff',
@@ -1260,8 +1399,11 @@ export default function App() {
                <span className="font-normal text-[10px] cursor-pointer hover:scale-110 transition-transform" onClick={()=>setTheme(t => t==='dark'?'light':'dark')} title="切换日夜模式">
                    {theme==='dark'?'🌞':'🌙'}
                </span>
+               <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setShowCoM(s => !s)} title="显示/隐藏整机质心">
+                   质心: {showCoM?'开':'关'}
+               </span>
                <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setIkMode(m => m==='global'?'selected':'global')} title="全局: IK追溯至根节点&#10;选中: IK仅在已框选的关节之间起效">
-                   IK范围: {ikMode==='global'?'全局(链式)':'仅限选中'}
+                   IK: {ikMode==='global'?'链式':'局部'}
                </span>
                <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setSpace(s => s==='local'?'world':'local')}>
                    {space.toUpperCase()}
@@ -1270,7 +1412,7 @@ export default function App() {
           </div>
         </div>
 
-        {robotData && <Viewport3D ref={viewportRef} theme={theme} mode={mode} selType={selType} space={space} ikMode={ikMode} currentFrame={currentFrame} keyframes={keyframes} isPlaying={isPlaying} selectedBones={selectedBones} onSelectBone={setSelectedBones} robotData={robotData} fileMap={fileMap} />}
+        {robotData && <Viewport3D ref={viewportRef} theme={theme} mode={mode} selType={selType} space={space} ikMode={ikMode} showCoM={showCoM} currentFrame={currentFrame} keyframes={keyframes} isPlaying={isPlaying} selectedBones={selectedBones} onSelectBone={setSelectedBones} robotData={robotData} fileMap={fileMap} />}
       </div>
     </div>
   );

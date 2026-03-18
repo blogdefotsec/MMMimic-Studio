@@ -18,8 +18,8 @@
 
 ```
 # 克隆仓库
-git clone [https://github.com/你的用户名/mmd-robot-editor.git](https://github.com/你的用户名/mmd-robot-editor.git)
-cd mmd-robot-editor
+git clone https://github.com/blogdefotsec/MMMimic-Studio
+cd MMMimic-Studio
 
 # 安装依赖
 npm install
