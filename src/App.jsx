@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useImperativeHandle, forwardRef, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useImperativeHandle, forwardRef, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
@@ -6,7 +6,7 @@ import { CCDIKSolver } from 'three/examples/jsm/animation/CCDIKSolver.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
 // ==========================================
-// 0. 内置超级 URDF 引擎 (含 Inertial 解析)
+// 0. 内置超级 URDF 引擎
 // ==========================================
 const MOCK_URDF_XML = `
 <robot name="Placeholder_Bot">
@@ -103,7 +103,7 @@ function clampJoint(bone, jointData) {
 }
 
 // ==========================================
-// 1. 核心数学与图表
+// 1. 核心数学与高维数据清洗引擎 (极致缓存优化版)
 // ==========================================
 function cubicBezier(t, p0, p1, p2, p3) { return (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 + 3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3; }
 function solveBezier(x, x1, y1, x2, y2) {
@@ -119,27 +119,73 @@ function solveBezier(x, x1, y1, x2, y2) {
   return cubicBezier(t, 0, y1, y2, 1);
 }
 
+const _frameCache = new WeakMap();
+function getSortedKeys(keysObj) {
+    if (!keysObj) return [];
+    let sorted = _frameCache.get(keysObj);
+    if (!sorted) {
+        sorted = Object.keys(keysObj).map(Number).sort((a,b) => a-b);
+        _frameCache.set(keysObj, sorted);
+    }
+    return sorted;
+}
+
+function evaluate1DTrack(frame, keys, defaultVal) {
+    if (!keys) return defaultVal;
+    if (keys[frame]) return keys[frame].v;
+    
+    const sorted = getSortedKeys(keys);
+    if (sorted.length === 0) return defaultVal;
+    if (frame <= sorted[0]) return keys[sorted[0]].v;
+    if (frame >= sorted[sorted.length - 1]) return keys[sorted[sorted.length - 1]].v;
+    
+    let pF = -1, nF = Infinity;
+    for (let i = 0; i < sorted.length; i++) {
+        if (sorted[i] < frame) pF = sorted[i];
+        else if (sorted[i] > frame) { nF = sorted[i]; break; }
+    }
+    
+    if (pF !== -1 && nF !== Infinity) {
+        const linear_t = (frame - pF) / (nF - pF);
+        const curve = keys[nF].c || [0.25, 0.25, 0.75, 0.75];
+        const eased_t = solveBezier(linear_t, curve[0], curve[1], curve[2], curve[3]);
+        return keys[pF].v + (keys[nF].v - keys[pF].v) * eased_t;
+    }
+    return defaultVal;
+}
+
 function evaluateFrame(frame, keyframes, robotData) {
     const state = {};
-    const allBones = [robotData.rootLink, ...Object.keys(robotData.joints)];
+    const rootLink = robotData.rootLink;
+
+    const px = evaluate1DTrack(frame, keyframes[`${rootLink}_px`], 0);
+    const py = evaluate1DTrack(frame, keyframes[`${rootLink}_py`], 0);
+    const pz = evaluate1DTrack(frame, keyframes[`${rootLink}_pz`], 0);
+    const rx = evaluate1DTrack(frame, keyframes[`${rootLink}_rx`], 0);
+    const ry = evaluate1DTrack(frame, keyframes[`${rootLink}_ry`], 0);
+    const rz = evaluate1DTrack(frame, keyframes[`${rootLink}_rz`], 0);
     
-    allBones.forEach(boneName => {
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(rx, ry, rz, 'ZYX')).toArray();
+    state[rootLink] = { p: [px, py, pz], q: q };
+
+    Object.keys(robotData.joints).forEach(boneName => {
         const keys = keyframes[boneName];
-        let defaultQ = [0,0,0,1]; let defaultP = [0,0,0];
         const jointData = robotData.joints[boneName];
-        if (jointData) {
-            defaultQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX')).toArray();
-            defaultP = [...jointData.xyz];
-        }
+        const defaultQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX')).toArray();
+        const defaultP = [...jointData.xyz];
 
         if (!keys) { state[boneName] = { q: defaultQ, p: defaultP }; return; }
         if (keys[frame]) { state[boneName] = { q: keys[frame].v, p: keys[frame].p || defaultP }; return; }
         
+        const sorted = getSortedKeys(keys);
+        if (sorted.length === 0) { state[boneName] = { q: defaultQ, p: defaultP }; return; }
+        if (frame <= sorted[0]) { state[boneName] = { q: keys[sorted[0]].v, p: keys[sorted[0]].p || defaultP }; return; }
+        if (frame >= sorted[sorted.length - 1]) { state[boneName] = { q: keys[sorted[sorted.length - 1]].v, p: keys[sorted[sorted.length - 1]].p || defaultP }; return; }
+
         let pF = -1, nF = Infinity;
-        for (let f in keys) {
-            const numF = Number(f);
-            if (numF < frame && numF > pF) pF = numF;
-            if (numF > frame && numF < nF) nF = numF;
+        for (let i = 0; i < sorted.length; i++) {
+            if (sorted[i] < frame) pF = sorted[i];
+            else if (sorted[i] > frame) { nF = sorted[i]; break; }
         }
         
         if (pF !== -1 && nF !== Infinity) {
@@ -151,16 +197,105 @@ function evaluateFrame(frame, keyframes, robotData) {
             const pPrev = new THREE.Vector3().fromArray(keys[pF].p || defaultP);
             const pNext = new THREE.Vector3().fromArray(keys[nF].p || defaultP);
             state[boneName] = { q: qPrev.slerp(qNext, eased_t).toArray(), p: pPrev.lerp(pNext, eased_t).toArray() };
-        } else if (pF !== -1) {
-            state[boneName] = { q: keys[pF].v, p: keys[pF].p || defaultP };
-        } else if (nF !== Infinity) {
-            state[boneName] = { q: keys[nF].v, p: keys[nF].p || defaultP };
-        } else {
-            state[boneName] = { q: defaultQ, p: defaultP };
         }
     });
     return state;
 }
+
+const extractAngle = (qTotalArray, jointData) => {
+    const qTotal = new THREE.Quaternion().fromArray(qTotalArray);
+    const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
+    const qJoint = qOrigin.clone().invert().multiply(qTotal);
+    const axisVec = new THREE.Vector3(...jointData.axis).normalize();
+    const sinHalfTheta = qJoint.x * axisVec.x + qJoint.y * axisVec.y + qJoint.z * axisVec.z;
+    const cosHalfTheta = qJoint.w;
+    let angle = 2 * Math.atan2(sinHalfTheta, cosHalfTheta);
+    while (angle > Math.PI) angle -= 2 * Math.PI;
+    while (angle < -Math.PI) angle += 2 * Math.PI;
+    return angle;
+};
+
+const reconstructQuaternion = (angle, jointData) => {
+    const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
+    const axisVec = new THREE.Vector3(...jointData.axis).normalize();
+    const qJoint = new THREE.Quaternion().setFromAxisAngle(axisVec, angle);
+    return qOrigin.multiply(qJoint).toArray();
+};
+
+const extractBoneSequence = (trackName, minF, maxF, keyframes, robotData) => {
+    const points = [];
+    const isRootAxis = trackName.startsWith(robotData.rootLink + '_');
+    const realBoneName = isRootAxis ? robotData.rootLink : trackName;
+    const jointData = isRootAxis ? null : robotData.joints[realBoneName];
+
+    let lastVal = 0; 
+    for (let f = minF; f <= maxF; f++) {
+        if (isRootAxis) {
+            const val = evaluate1DTrack(f, keyframes[trackName], 0);
+            let v = val;
+            if (trackName.includes('_r')) {
+                if (points.length > 0) {
+                    while(v - lastVal > Math.PI) v -= Math.PI*2;
+                    while(v - lastVal < -Math.PI) v += Math.PI*2;
+                }
+                lastVal = v;
+                points.push({ f, vals: [v * 180 / Math.PI], p: [0,0,0] });
+            } else {
+                points.push({ f, vals: [v * 100], p: [0,0,0] }); 
+            }
+        } else {
+            const state = evaluateFrame(f, keyframes, robotData);
+            if (!state[trackName]) continue;
+            let angle = extractAngle(state[trackName].q, jointData);
+            if (points.length > 0) {
+                while(angle - lastVal > Math.PI) angle -= Math.PI*2;
+                while(angle - lastVal < -Math.PI) angle += Math.PI*2;
+            }
+            lastVal = angle;
+            points.push({ f, vals: [angle * 180 / Math.PI], p: state[trackName].p });
+        }
+    }
+    return points;
+};
+
+const reconstructBoneState = (vals, trackName, robotData, originalP) => {
+    const isRootAxis = trackName.startsWith(robotData.rootLink + '_');
+    if (isRootAxis) {
+        let v = trackName.includes('_p') ? vals[0] / 100 : vals[0] * Math.PI / 180;
+        return { v: v, c: [0.25, 0.25, 0.75, 0.75] };
+    } else {
+        const jointData = robotData.joints[trackName];
+        const q = reconstructQuaternion(vals[0] * Math.PI / 180, jointData);
+        return { v: q, p: originalP, c: [0.25, 0.25, 0.75, 0.75] };
+    }
+};
+
+const douglasPeuckerN = (points, epsilon) => {
+    if (points.length <= 2) return points;
+    let maxDist = 0; let index = 0;
+    const p1 = points[0]; const p2 = points[points.length - 1];
+    
+    for (let i = 1; i < points.length - 1; i++) {
+        const p = points[i];
+        let dist = 0;
+        for (let dim = 0; dim < p.vals.length; dim++) {
+            let interp = 0;
+            if (p2.f === p1.f) interp = p1.vals[dim];
+            else interp = p1.vals[dim] + (p.f - p1.f) * (p2.vals[dim] - p1.vals[dim]) / (p2.f - p1.f);
+            const d = Math.abs(p.vals[dim] - interp);
+            if (d > dist) dist = d; 
+        }
+        if (dist > maxDist) { maxDist = dist; index = i; }
+    }
+    
+    if (maxDist > epsilon) {
+        const left = douglasPeuckerN(points.slice(0, index + 1), epsilon);
+        const right = douglasPeuckerN(points.slice(index), epsilon);
+        return left.slice(0, left.length - 1).concat(right);
+    } else {
+        return [p1, p2];
+    }
+};
 
 const IconStart = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="19 20 9 12 19 4 19 20"></polygon><line x1="5" y1="19" x2="5" y2="5"></line></svg>;
 const IconEnd = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="5" x2="19" y2="19"></line></svg>;
@@ -170,7 +305,7 @@ const IconPlay = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="non
 const IconPause = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>;
 
 // ==========================================
-// 2. 曲线编辑器
+// 2. 曲线编辑器组件
 // ==========================================
 const CurveEditor = ({ curve, onChange, disabled, theme }) => {
   const canvasRef = useRef(null);
@@ -180,7 +315,7 @@ const CurveEditor = ({ curve, onChange, disabled, theme }) => {
     const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext('2d'); const rect = canvas.parentElement.getBoundingClientRect();
     if(rect.width === 0 || rect.height === 0) return; 
-    canvas.width = rect.width; canvas.height = rect.height - 30; ctx.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.width = rect.width; canvas.height = rect.height; ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (disabled) { 
         ctx.fillStyle = theme === 'dark' ? '#555' : '#aaa'; 
         ctx.font = '12px sans-serif'; ctx.textAlign = 'center'; 
@@ -221,23 +356,333 @@ const CurveEditor = ({ curve, onChange, disabled, theme }) => {
   };
 
   return (
-    <div className="flex-1 flex flex-col bg-[var(--bg-main)] border-t-2 border-[var(--border)] min-h-[200px]">
-      <div className="h-[30px] bg-[var(--bg-header)] px-3 py-1 text-xs font-bold border-b border-[var(--border)] flex justify-between items-center text-[var(--text-main)]">
-        <span>插值曲线</span>
-        {!disabled && <span className="font-normal" style={{color: theme === 'dark' ? '#c586c0' : '#8a2be2'}}>P1({curve[0].toFixed(2)}, {curve[1].toFixed(2)})</span>}
-      </div>
-      <div className="flex-1 w-full relative">
-         <canvas ref={canvasRef} className={`absolute inset-0 block ${disabled ? 'cursor-not-allowed' : 'cursor-crosshair'}`} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={() => setDragging(0)} onPointerLeave={() => setDragging(0)} />
-      </div>
+    <div className="flex-1 w-full relative">
+       <canvas ref={canvasRef} className={`absolute inset-0 block ${disabled ? 'cursor-not-allowed' : 'cursor-crosshair'}`} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={() => setDragging(0)} onPointerLeave={() => setDragging(0)} />
+       {!disabled && <span className="absolute top-2 right-2 text-xs font-normal" style={{color: theme === 'dark' ? '#c586c0' : '#8a2be2'}}>P1({curve[0].toFixed(2)}, {curve[1].toFixed(2)})</span>}
     </div>
   );
 };
 
 // ==========================================
-// 3. 高性能时间轴组件 (数据可视化版)
+// 3. 🔴 全维极速数据清洗与动态示波器面板
+// ==========================================
+const CHART_COLORS = ['#007acc', '#c586c0', '#4caf50', '#d32f2f', '#ff9800', '#00bcd4', '#9c27b0', '#e91e63'];
+
+const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBones, currentFrame, keyframes, selectionBox, totalFrames, setKeyframes, setProgressTask, theme }) => {
+    const canvasRef = useRef(null);
+    const [cleanMode, setCleanMode] = useState('spike'); // 'spike' | 'clip' | 'decimate'
+    const [threshold, setThreshold] = useState(15);
+    const [tolerance, setTolerance] = useState(2.0);
+
+    const getActualBonesFromSelection = () => {
+        if (!selectionBox) return [];
+        const minB = Math.min(selectionBox.startBone, selectionBox.endBone);
+        const maxB = Math.max(selectionBox.startBone, selectionBox.endBone);
+        const actualBones = new Set();
+        for (let i = minB; i <= maxB; i++) {
+            const vBone = visibleJoints[i];
+            if (vBone === robotData.rootLink) {
+                ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].forEach(ext => actualBones.add(robotData.rootLink + ext));
+            } else {
+                actualBones.add(vBone);
+            }
+        }
+        return Array.from(actualBones);
+    };
+
+    const fullTrackData = useMemo(() => {
+        if (!robotData || (!selectionBox && (!selectedBones || selectedBones.length === 0))) return null;
+        
+        const mode = selectionBox ? 'edit' : 'monitor';
+        const targetBones = selectionBox ? getActualBonesFromSelection() : selectedBones;
+        const extractMin = selectionBox ? Math.min(selectionBox.startFrame, selectionBox.endFrame) : 0;
+        const extractMax = selectionBox ? Math.max(selectionBox.startFrame, selectionBox.endFrame) : totalFrames;
+
+        const data = {};
+        let maxDelta = 0.1;
+        let hasData = false;
+
+        for (let bIdx = 0; bIdx < targetBones.length; bIdx++) {
+            const bone = targetBones[bIdx];
+            const points = extractBoneSequence(bone, extractMin, extractMax, keyframes, robotData);
+            if (points.length === 0) continue;
+
+            const deltas = [];
+            for (let i = 0; i < points.length; i++) {
+                if (i === 0) {
+                    deltas.push({ f: points[i].f, dVals: new Array(points[i].vals.length).fill(0) });
+                } else {
+                    const dVals = points[i].vals.map((v, dim) => v - points[i-1].vals[dim]);
+                    deltas.push({ f: points[i].f, dVals });
+                    dVals.forEach(d => { if (Math.abs(d) > maxDelta) maxDelta = Math.abs(d); });
+                }
+            }
+            data[bone] = { points, deltas };
+            hasData = true;
+        }
+        return hasData ? { data, maxDelta, minF: extractMin, maxF: extractMax, mode, bones: targetBones } : null;
+    }, [robotData, keyframes, selectionBox, selectedBones, totalFrames]); 
+
+    const legendItems = useMemo(() => {
+        if (!fullTrackData) return [];
+        const items = [];
+        let cIdx = 0;
+        Object.keys(fullTrackData.data).forEach(bone => {
+            const { deltas } = fullTrackData.data[bone];
+            const dims = deltas[0].dVals.length;
+            for (let dim = 0; dim < dims; dim++) {
+                let name = bone;
+                if (robotData && bone.startsWith(robotData.rootLink + '_')) {
+                    const parts = bone.split('_');
+                    const axis = parts.pop().toUpperCase();
+                    name = `${parts.join('_')} (${axis})`;
+                }
+                items.push({ name, color: CHART_COLORS[cIdx % CHART_COLORS.length] });
+                cIdx++;
+            }
+        });
+        return items;
+    }, [fullTrackData, robotData]);
+
+    const drawChart = useCallback(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || !fullTrackData) return;
+        const ctx = canvas.getContext('2d');
+        const rect = canvas.parentElement.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, rect.width, rect.height);
+
+        const w = rect.width; const h = rect.height;
+        const padX = 20; const padY = 20;
+        const drawW = w - padX * 2; const drawH = h - padY * 2;
+
+        ctx.strokeStyle = theme === 'dark' ? '#555' : '#ccc';
+        ctx.beginPath(); ctx.moveTo(padX, h / 2); ctx.lineTo(w - padX, h / 2); ctx.stroke();
+
+        if (cleanMode === 'spike' || cleanMode === 'clip') {
+            const tY = (threshold / fullTrackData.maxDelta) * (drawH / 2);
+            if (tY < drawH / 2) {
+                ctx.strokeStyle = 'rgba(255, 0, 0, 0.4)';
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.moveTo(padX, h / 2 - tY); ctx.lineTo(w - padX, h / 2 - tY);
+                ctx.moveTo(padX, h / 2 + tY); ctx.lineTo(w - padX, h / 2 + tY);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+        }
+
+        let renderMinF = fullTrackData.minF;
+        let renderMaxF = fullTrackData.maxF;
+        if (fullTrackData.mode === 'monitor') {
+            const halfWindow = 40; 
+            renderMinF = Math.max(0, currentFrame - halfWindow);
+            renderMaxF = Math.min(totalFrames, currentFrame + halfWindow);
+        }
+        const totalF = renderMaxF - renderMinF;
+
+        let cIdx = 0;
+        Object.keys(fullTrackData.data).forEach(bone => {
+            const { deltas } = fullTrackData.data[bone];
+            const dims = deltas[0].dVals.length;
+            
+            for (let dim = 0; dim < dims; dim++) {
+                ctx.strokeStyle = CHART_COLORS[cIdx % CHART_COLORS.length];
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                
+                let isFirstPoint = true;
+                for (let i = 0; i < deltas.length; i++) {
+                    const pt = deltas[i];
+                    if (pt.f < renderMinF || pt.f > renderMaxF) continue; 
+                    const x = padX + (totalF === 0 ? 0 : (pt.f - renderMinF) / totalF * drawW);
+                    const y = h / 2 - (pt.dVals[dim] / fullTrackData.maxDelta) * (drawH / 2);
+                    if (isFirstPoint) { ctx.moveTo(x, y); isFirstPoint = false; } else ctx.lineTo(x, y);
+                }
+                ctx.stroke();
+                cIdx++;
+            }
+        });
+
+        if (fullTrackData.mode === 'monitor' && totalF > 0) {
+            const playX = padX + ((currentFrame - renderMinF) / totalF) * drawW;
+            ctx.strokeStyle = theme === 'dark' ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.4)';
+            ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(playX, 0); ctx.lineTo(playX, h); ctx.stroke();
+            
+            ctx.fillStyle = theme === 'dark' ? '#fff' : '#000';
+            ctx.font = 'bold 10px sans-serif';
+            ctx.fillText(`Frame ${currentFrame}`, playX + 6, 18);
+        }
+
+        ctx.fillStyle = theme === 'dark' ? '#aaa' : '#666';
+        ctx.font = '10px sans-serif';
+        ctx.fillText(`Max Δ: ${fullTrackData.maxDelta.toFixed(1)}`, padX, 15);
+    }, [fullTrackData, cleanMode, threshold, theme, currentFrame, totalFrames]);
+
+    useEffect(() => { drawChart(); }, [drawChart]);
+    useEffect(() => { window.addEventListener('resize', drawChart); return () => window.removeEventListener('resize', drawChart); }, [drawChart]);
+
+    const execute = async () => {
+        if (!robotData || !fullTrackData || fullTrackData.mode !== 'edit') return;
+        
+        setProgressTask({ title: "初始化清洗引擎...", percent: 0 });
+        await new Promise(r => setTimeout(r, 50)); 
+
+        let nextDict = { ...keyframes };
+        const bonesToProcess = [];
+        for (let bIdx = 0; bIdx < fullTrackData.bones?.length; bIdx++) {
+            if (fullTrackData?.data[fullTrackData.bones[bIdx]]?.points?.length >= 3) {
+                bonesToProcess.push(fullTrackData.bones[bIdx]);
+            }
+        }
+
+        for (let i = 0; i < bonesToProcess.length; i++) {
+            const boneName = bonesToProcess[i];
+            const points = fullTrackData.data[boneName].points;
+            
+            nextDict[boneName] = { ...keyframes[boneName] };
+
+            setProgressTask({ title: `正在清洗轨道: ${boneName}...`, percent: Math.round((i / bonesToProcess.length) * 100) });
+            await new Promise(r => setTimeout(r, 0)); 
+
+            if (cleanMode === 'spike') {
+                // 浅拷贝避免内存尖峰
+                const smoothed = points.map(p => ({ f: p.f, vals: [...p.vals], p: p.p }));
+                const windowSize = 5; 
+                const halfW = Math.floor(windowSize / 2);
+
+                for (let dim = 0; dim < points[0].vals.length; dim++) {
+                    for (let ptIdx = halfW; ptIdx < points.length - halfW; ptIdx++) {
+                        let windowVals = [];
+                        for (let w = -halfW; w <= halfW; w++) windowVals.push(points[ptIdx + w].vals[dim]);
+                        windowVals.sort((a, b) => a - b);
+                        const med = windowVals[halfW]; 
+                        if (Math.abs(points[ptIdx].vals[dim] - med) > threshold) {
+                            smoothed[ptIdx].vals[dim] = med;
+                        }
+                    }
+                }
+                
+                smoothed.forEach(pt => {
+                    nextDict[boneName][pt.f] = reconstructBoneState(pt.vals, boneName, robotData, pt.p);
+                });
+
+            } else if (cleanMode === 'clip') {
+                const maxDelta = threshold; 
+                const clipped = points.map(p => ({ f: p.f, vals: [...p.vals], p: p.p }));
+                
+                for (let dim = 0; dim < points[0].vals.length; dim++) {
+                    // 🔴 修正算法：正反向削峰必须乘以两帧之间的差值，以适配稀疏区间
+                    for (let ptIdx = 1; ptIdx < clipped.length; ptIdx++) {
+                        const prev = clipped[ptIdx - 1].vals[dim];
+                        const curr = clipped[ptIdx].vals[dim];
+                        const allowed = maxDelta * (clipped[ptIdx].f - clipped[ptIdx - 1].f);
+                        if (curr > prev + allowed) clipped[ptIdx].vals[dim] = prev + allowed;
+                        else if (curr < prev - allowed) clipped[ptIdx].vals[dim] = prev - allowed;
+                    }
+                    for (let ptIdx = clipped.length - 2; ptIdx >= 0; ptIdx--) {
+                        const next = clipped[ptIdx + 1].vals[dim];
+                        const curr = clipped[ptIdx].vals[dim];
+                        const allowed = maxDelta * (clipped[ptIdx + 1].f - clipped[ptIdx].f);
+                        if (curr > next + allowed) clipped[ptIdx].vals[dim] = next + allowed;
+                        else if (curr < next - allowed) clipped[ptIdx].vals[dim] = next - allowed;
+                    }
+                }
+                
+                clipped.forEach(pt => {
+                    nextDict[boneName][pt.f] = reconstructBoneState(pt.vals, boneName, robotData, pt.p);
+                });
+
+            } else if (cleanMode === 'decimate') {
+                const decimatedPoints = douglasPeuckerN(points, tolerance);
+                const validFrames = new Set(decimatedPoints.map(pt => pt.f));
+                
+                for (let f = fullTrackData.minF; f <= fullTrackData.maxF; f++) {
+                    if (validFrames.has(f)) {
+                        const pt = decimatedPoints.find(p => p.f === f);
+                        nextDict[boneName][f] = reconstructBoneState(pt.vals, boneName, robotData, pt.p);
+                    } else {
+                        delete nextDict[boneName][f];
+                    }
+                }
+            }
+        }
+
+        setProgressTask({ title: "整合时间轴数据...", percent: 100 });
+        await new Promise(r => setTimeout(r, 50));
+        
+        setKeyframes(nextDict);
+        setProgressTask(null); 
+    };
+
+    if (!fullTrackData) {
+        return <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-muted)]">请在左侧点击骨骼或框选时间段以监视数据</div>;
+    }
+
+    return (
+        <div className="flex-1 flex flex-col relative w-full h-full overflow-hidden">
+            <div className="flex-1 w-full relative overflow-hidden">
+                <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" />
+                
+                {legendItems.length > 0 && (
+                    <div className="absolute top-2 right-2 flex flex-col gap-1.5 max-h-[calc(100%-16px)] overflow-y-auto bg-[var(--bg-panel)]/80 backdrop-blur-[2px] p-2 rounded border border-[var(--border)] shadow-md pointer-events-auto z-10" style={{ scrollbarWidth: 'none' }}>
+                        {legendItems.map((item, idx) => (
+                            <div key={idx} className="flex items-center gap-1.5">
+                                <div className="w-2.5 h-2.5 rounded-full shrink-0 shadow-sm" style={{ backgroundColor: item.color }}></div>
+                                <span className="text-[10px] text-[var(--text-main)] font-mono whitespace-nowrap leading-none">{item.name}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+            
+            <div className="h-[36px] bg-[var(--bg-header)] border-t border-[var(--border)] flex items-center px-2 gap-2 text-xs shrink-0 relative z-10">
+                <select value={cleanMode} onChange={e=>setCleanMode(e.target.value)} className="bg-[var(--bg-main)] border border-[var(--border)] text-[var(--text-main)] outline-none rounded p-1">
+                    <option value="spike">滤除突变(除抖)</option>
+                    <option value="clip">暴力削峰(限速)</option>
+                    <option value="decimate">语义抽稀(压缩)</option>
+                </select>
+                
+                {cleanMode === 'spike' || cleanMode === 'clip' ? (
+                    <label className="flex items-center gap-1">
+                        <span className="text-[var(--text-muted)]">阈值:</span>
+                        <input type="number" min={1} max={180} value={threshold} onChange={e=>setThreshold(Number(e.target.value))} className="w-12 bg-[var(--bg-main)] border border-[var(--border)] text-center text-[var(--text-main)] outline-none rounded p-0.5" />
+                        <span className="text-[var(--text-muted)]">°/f</span>
+                    </label>
+                ) : (
+                    <label className="flex items-center gap-1">
+                        <span className="text-[var(--text-muted)]">容差:</span>
+                        <input type="number" min={0.1} max={45} step={0.1} value={tolerance} onChange={e=>setTolerance(Number(e.target.value))} className="w-12 bg-[var(--bg-main)] border border-[var(--border)] text-center text-[var(--text-main)] outline-none rounded p-0.5" />
+                        <span className="text-[var(--text-muted)]">°</span>
+                    </label>
+                )}
+
+                {fullTrackData.mode === 'edit' ? (
+                    <button onClick={execute} className="ml-auto px-3 py-1 bg-[#007acc] hover:bg-[#0098ff] text-white rounded font-bold transition-colors shadow">⚡ 执行清洗</button>
+                ) : (
+                    <div className="ml-auto flex items-center gap-2">
+                        <span className="text-[10px] text-[#ff9800] bg-[#ff980022] px-2 py-0.5 rounded border border-[#ff980055]">
+                            👀 监视模式
+                        </span>
+                        <button disabled className="px-3 py-1 bg-[var(--bg-hover)] text-[var(--text-muted)] rounded font-bold cursor-not-allowed border border-[var(--border)]">⚡ 需框选后执行</button>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+// ==========================================
+// 4. 高性能时间轴组件
 // ==========================================
 const Timeline = ({ 
-  robotData, boneNames, totalFrames, setTotalFrames,
+  robotData, visibleJoints, isBaseExpanded, setIsBaseExpanded, totalFrames, setTotalFrames,
+  currentState,
   currentFrame, setCurrentFrame, keyframes, 
   selectedBones, onSelectBone, activeKey, setActiveKey, 
   selectionBox, setSelectionBox, isDraggingTimeline, setIsDraggingTimeline,
@@ -245,24 +690,28 @@ const Timeline = ({
   isPlaying, setIsPlaying, onStart, onEnd, onPrevKey, onNextKey, onRequestChangeTotalFrames, theme
 }) => {
   const scrollRef = useRef(null);
-  const timelineContentRef = useRef(null);
   const keyframeCanvasRef = useRef(null); 
   const [rangeStart, setRangeStart] = useState(0); 
   const [rangeEnd, setRangeEnd] = useState(60);
-  const [angleUnit, setAngleUnit] = useState('degree'); // 🔴 新增：弧度/角度切换状态
+  const [angleUnit, setAngleUnit] = useState('degree'); 
 
   useEffect(() => {
     if (isPlaying && scrollRef.current) {
-      const container = scrollRef.current; const targetX = currentFrame * 20; const viewWidth = container.clientWidth; const currentScroll = container.scrollLeft;
-      if (targetX > currentScroll + viewWidth - 170) container.scrollTo({ left: targetX - viewWidth / 2, behavior: 'auto' });
-      else if (targetX < currentScroll) container.scrollTo({ left: Math.max(0, targetX - 40), behavior: 'auto' });
+      const container = scrollRef.current; 
+      const targetX = currentFrame * 20; 
+      const viewWidth = container.clientWidth - 180; 
+      const currentScroll = container.scrollLeft;
+      
+      if (targetX > currentScroll + viewWidth * 0.8 || targetX < currentScroll) {
+          container.scrollTo({ left: Math.max(0, targetX - viewWidth * 0.2), behavior: 'auto' });
+      }
     }
   }, [currentFrame, isPlaying]);
 
   const drawCanvas = useCallback(() => {
       const canvas = keyframeCanvasRef.current;
       const scrollEl = scrollRef.current;
-      if (!canvas || !scrollEl) return;
+      if (!canvas || !scrollEl || !robotData) return;
 
       const rect = canvas.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return;
@@ -286,17 +735,22 @@ const Timeline = ({
       const startFrame = Math.max(0, Math.floor(sL / 20) - 1);
       const endFrame = Math.min(totalFrames, Math.ceil((sL + rect.width) / 20) + 1);
       const startBone = Math.max(0, Math.floor(sT / 24) - 1);
-      const endBone = Math.min(boneNames.length - 1, Math.ceil((sT + rect.height) / 24) + 1);
+      const endBone = Math.min(visibleJoints.length - 1, Math.ceil((sT + rect.height) / 24) + 1);
 
       ctx.fillStyle = theme === 'dark' ? '#c586c0' : '#8a2be2';
       for (let bIdx = startBone; bIdx <= endBone; bIdx++) {
-          const bone = boneNames[bIdx];
-          const keys = keyframes[bone];
-          if (!keys) continue;
-
+          const bone = visibleJoints[bIdx];
           const cy = bIdx * 24 + 12 - sT;
+          
           for (let f = startFrame; f <= endFrame; f++) {
-              if (keys[f]) {
+              let hasKey = false;
+              if (bone === robotData.rootLink) {
+                  hasKey = ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].some(ext => keyframes[robotData.rootLink + ext]?.[f]);
+              } else {
+                  hasKey = !!keyframes[bone]?.[f];
+              }
+
+              if (hasKey) {
                   if (activeKey?.bone === bone && activeKey?.frame === f) continue;
                   const cx = f * 20 + 10 - sL;
                   ctx.beginPath(); ctx.arc(cx, cy, 3.5, 0, Math.PI * 2); ctx.fill();
@@ -304,8 +758,11 @@ const Timeline = ({
           }
       }
 
-      if (activeKey && keyframes[activeKey.bone]?.[activeKey.frame]) {
-          const bIdx = boneNames.indexOf(activeKey.bone);
+      if (activeKey) {
+          let bIdx = visibleJoints.indexOf(activeKey.bone);
+          if (bIdx === -1 && activeKey.bone.startsWith(robotData.rootLink + '_') && !isBaseExpanded) {
+              bIdx = visibleJoints.indexOf(robotData.rootLink);
+          }
           if (bIdx >= startBone && bIdx <= endBone && activeKey.frame >= startFrame && activeKey.frame <= endFrame) {
               const cx = activeKey.frame * 20 + 10 - sL;
               const cy = bIdx * 24 + 12 - sT;
@@ -317,7 +774,7 @@ const Timeline = ({
           }
       }
       ctx.restore();
-  }, [keyframes, activeKey, totalFrames, boneNames, theme]);
+  }, [keyframes, activeKey, totalFrames, visibleJoints, theme, isBaseExpanded, robotData]);
 
   useEffect(() => { drawCanvas(); }, [drawCanvas]);
   useEffect(() => {
@@ -332,21 +789,27 @@ const Timeline = ({
   const getCoordinatesFromEvent = (e) => {
       const rect = scrollRef.current.getBoundingClientRect();
       const mouseX = e.clientX - rect.left; const mouseY = e.clientY - rect.top;
-      if (mouseX < 180 || mouseY < 24) return null; // 🔴 将点击拦截区域拓宽为 180px
+      if (mouseX < 180 || mouseY < 24) return null; 
       const sL = scrollRef.current.scrollLeft; const sT = scrollRef.current.scrollTop;
       const x = mouseX - 180 + sL; const y = mouseY - 24 + sT;
       const frame = Math.max(0, Math.min(totalFrames, Math.floor(x / 20)));
-      const boneIdx = Math.max(0, Math.min(boneNames.length - 1, Math.floor(y / 24)));
+      const boneIdx = Math.max(0, Math.min(visibleJoints.length - 1, Math.floor(y / 24)));
       return { frame, boneIdx };
   };
 
   const handlePointerDown = (e) => {
       const coords = getCoordinatesFromEvent(e); if (!coords) return;
       const { frame, boneIdx } = coords;
-      setIsDraggingTimeline(true); setSelectionBox({ startBone: boneIdx, endBone: boneIdx, startFrame: frame, endFrame: frame }); setCurrentFrame(frame);
-      const boneName = boneNames[boneIdx];
-      if (!selectedBones.includes(boneName)) onSelectBone([boneName]);
-      if (keyframes[boneName] && keyframes[boneName][frame]) setActiveKey({ bone: boneName, frame }); else setActiveKey(null);
+      setIsDraggingTimeline(true); 
+      setSelectionBox({ startBone: boneIdx, endBone: boneIdx, startFrame: frame, endFrame: frame }); 
+      setCurrentFrame(frame);
+      
+      const vBone = visibleJoints[boneIdx];
+      let bNames = [vBone];
+      if (vBone === robotData.rootLink) bNames = ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => robotData.rootLink + ext);
+      
+      onSelectBone(bNames);
+      if (keyframes[bNames[0]] && keyframes[bNames[0]][frame]) setActiveKey({ bone: bNames[0], frame }); else setActiveKey(null);
   };
   const handlePointerMove = (e) => {
       if (!isDraggingTimeline) return;
@@ -354,9 +817,6 @@ const Timeline = ({
       setSelectionBox(prev => ({ ...prev, endBone: coords.boneIdx, endFrame: coords.frame }));
   };
   const handleScrollToCurrent = () => { if (scrollRef.current) scrollRef.current.scrollTo({ left: Math.max(0, currentFrame * 20 - 50), behavior: 'smooth' }); };
-
-  // 🔴 实时物理状态提取：为每一帧在表格旁计算并显示当前角度数据
-  const currentState = robotData ? evaluateFrame(currentFrame, keyframes, robotData) : {};
 
   const bgGrid = `repeating-linear-gradient(to right, var(--border) 0px, transparent 1px, transparent 20px)`;
 
@@ -371,11 +831,10 @@ const Timeline = ({
       </div>
       
       <div className="flex-1 relative overflow-hidden flex flex-col bg-[var(--bg-main)]">
-         {/* 🔴 扩展了Canvas和背景网格起始点至180px */}
          <canvas ref={keyframeCanvasRef} className="absolute pointer-events-none z-20" style={{ left: 180, top: 24, width: 'calc(100% - 198px)', height: 'calc(100% - 42px)' }} />
 
          <div ref={scrollRef} className="flex-1 overflow-auto relative select-none" onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}>
-            <div style={{ width: `${totalFrames * 20 + 180}px`, height: `${boneNames.length * 24 + 24}px` }} className="relative">
+            <div style={{ width: `${totalFrames * 20 + 180}px`, height: `${visibleJoints.length * 24 + 24}px` }} className="relative">
                <div className="sticky top-0 h-[24px] flex z-40 bg-[var(--bg-header)] border-b border-[var(--border)]">
                   <div className="sticky left-0 w-[180px] bg-[var(--bg-header)] z-50 border-r border-[var(--border)] flex justify-between items-center px-2 text-xs font-bold text-[var(--text-main)]" onPointerDown={e=>e.stopPropagation()}>
                       <span>节点 (Links)</span>
@@ -396,46 +855,54 @@ const Timeline = ({
                   </div>
                </div>
                <div className="relative" style={{ backgroundImage: bgGrid, backgroundPosition: '180px 0', backgroundSize: '20px 100%' }}>
-                  {boneNames.map((bone, boneIdx) => {
-                     const isRoot = robotData && bone === robotData.rootLink;
-                     const isSelected = selectedBones.includes(bone);
+                  {visibleJoints.map((bone, boneIdx) => {
+                     const isRootHeader = robotData && bone === robotData.rootLink;
+                     const isRootAxis = robotData && bone.startsWith(robotData.rootLink + '_');
                      
-                     // 🔴 解析计算当前显示的数据
+                     let isSelected = false;
+                     if (isRootHeader) isSelected = ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].some(ext => selectedBones.includes(robotData.rootLink + ext));
+                     else isSelected = selectedBones.includes(bone);
+                     
                      let displayVal = "-";
-                     const jointState = currentState[bone];
-                     if (jointState) {
-                         if (isRoot) {
-                             displayVal = `${jointState.p[0].toFixed(2)}, ${jointState.p[1].toFixed(2)}, ${jointState.p[2].toFixed(2)}`;
-                         } else if (robotData.joints[bone]) {
-                             const jointData = robotData.joints[bone];
-                             const qTotal = new THREE.Quaternion().fromArray(jointState.q);
-                             const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
-                             const qJoint = qOrigin.clone().invert().multiply(qTotal);
-                             const axisVec = new THREE.Vector3(...jointData.axis).normalize();
-                             const sinHalfTheta = qJoint.x * axisVec.x + qJoint.y * axisVec.y + qJoint.z * axisVec.z;
-                             const cosHalfTheta = qJoint.w;
-                             let angle = 2 * Math.atan2(sinHalfTheta, cosHalfTheta);
-                             while (angle > Math.PI) angle -= 2 * Math.PI;
-                             while (angle < -Math.PI) angle += 2 * Math.PI;
-                             
-                             // 🔴 智能格式化：根据当前选中的单位进行输出
-                             displayVal = angleUnit === 'degree' 
-                                 ? (angle * 180 / Math.PI).toFixed(1) + '°' 
-                                 : angle.toFixed(3) + ' rad';
+                     
+                     if (isRootAxis) {
+                         const axis = bone.split('_').pop();
+                         const val = evaluate1DTrack(currentFrame, keyframes[bone], 0);
+                         if (['px', 'py', 'pz'].includes(axis)) displayVal = val.toFixed(3) + 'm';
+                         else displayVal = angleUnit === 'degree' ? (val * 180 / Math.PI).toFixed(1) + '°' : val.toFixed(3) + ' rad';
+                     } else if (!isRootHeader) {
+                         const jointState = currentState[bone];
+                         if (jointState && robotData.joints[bone]) {
+                             const angle = extractAngle(jointState.q, robotData.joints[bone]);
+                             displayVal = angleUnit === 'degree' ? (angle * 180 / Math.PI).toFixed(1) + '°' : angle.toFixed(3) + ' rad';
                          }
                      }
 
+                     const shortName = isRootAxis ? `${bone.split('_').pop().toUpperCase()} 轴分量` : bone;
+
                      return (
                        <div key={bone} style={{backgroundColor: isSelected ? 'var(--bg-selected)' : 'transparent'}} className={`flex h-[24px] border-b border-[var(--border)] hover:bg-[var(--bg-hover)] transition-colors`}>
-                          <div className={`sticky left-0 w-[180px] z-30 px-2 py-1 font-mono text-[10px] border-r border-[var(--border)] cursor-pointer flex justify-between items-center ${isSelected ? 'bg-[var(--accent)] text-white' : (isRoot ? 'text-[#e55353] font-bold' : 'text-[var(--text-main)] bg-[var(--bg-panel)]')}`} onPointerDown={(e) => { e.stopPropagation(); onSelectBone([bone]); }}>
-                             <span className="truncate w-[100px]" title={bone}>{bone} {isRoot ? '(Base)' : ''}</span>
-                             {/* 🔴 添加了显示数值的右侧小标签 */}
+                          <div className={`sticky left-0 w-[180px] z-30 px-2 py-1 font-mono text-[10px] border-r border-[var(--border)] cursor-pointer flex justify-between items-center ${isSelected ? 'bg-[var(--accent)] text-white' : (isRootHeader ? 'text-[#e55353] font-bold bg-[var(--bg-panel)]' : 'text-[var(--text-main)] bg-[var(--bg-panel)]')} ${isRootAxis ? 'pl-6' : ''}`} onPointerDown={(e) => { 
+                              e.stopPropagation(); 
+                              setSelectionBox(null);
+                              if (isRootHeader) onSelectBone(['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => robotData.rootLink + ext));
+                              else onSelectBone([bone]); 
+                          }}>
+                             {isRootHeader ? (
+                                 <span className="truncate w-[100px] flex items-center" title={bone}>
+                                    <span onClick={(e) => { e.stopPropagation(); setIsBaseExpanded(!isBaseExpanded); setSelectionBox(null); }} className="mr-1 w-3 inline-block cursor-pointer hover:scale-125 transition-transform">{isBaseExpanded ? '▼' : '▶'}</span>
+                                    {bone} (Base)
+                                 </span>
+                             ) : (
+                                 <span className="truncate w-[100px]" title={bone}>{shortName}</span>
+                             )}
+                             
                              <span className={`text-[9px] text-right truncate w-[60px] ${isSelected ? 'text-[rgba(255,255,255,0.8)]' : 'text-[var(--accent)] font-bold'}`} title={displayVal}>{displayVal}</span>
                           </div>
                        </div>
                      );
                   })}
-                  <div style={{ position: 'absolute', left: 180 + currentFrame * 20, top: 0, width: 20, height: '100%', backgroundColor: 'rgba(0,122,204,0.2)', pointerEvents: 'none', zIndex: 10, borderLeft: '1px solid rgba(0,122,204,0.8)' }} />
+                  <div style={{ position: 'absolute', left: 180, transform: `translateX(${currentFrame * 20}px)`, top: 0, width: 20, height: '100%', backgroundColor: 'rgba(0,122,204,0.2)', pointerEvents: 'none', zIndex: 10, borderLeft: '1px solid rgba(0,122,204,0.8)', willChange: 'transform' }} />
                   {selectionBox && <div style={{ position: 'absolute', left: 180 + Math.min(selectionBox.startFrame, selectionBox.endFrame) * 20, top: Math.min(selectionBox.startBone, selectionBox.endBone) * 24, width: (Math.abs(selectionBox.endFrame - selectionBox.startFrame) + 1) * 20, height: (Math.abs(selectionBox.endBone - selectionBox.startBone) + 1) * 24, backgroundColor: 'rgba(0,152,255,0.3)', border: '1px solid #0098ff', pointerEvents: 'none', zIndex: 15 }} />}
                </div>
             </div>
@@ -469,9 +936,9 @@ const Timeline = ({
 };
 
 // ==========================================
-// 4. 支持真实 URDF 物理渲染的 3D 视图引擎 (含动态质心计算与地标)
+// 5. 支持真实 URDF 物理渲染的 3D 视图引擎
 // ==========================================
-const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentFrame, keyframes, isPlaying, selectedBones, onSelectBone, robotData, fileMap, theme }, ref) => {
+const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentFrame, currentState, isPlaying, selectedBones, onSelectBone, robotData, fileMap, theme }, ref) => {
   const containerRef = useRef(null);
   const boxRef = useRef(null); 
 
@@ -488,8 +955,10 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
           if (mode === 'select') stateRef.current.transformControl.detach();
           else if (mode === 'rotate' || mode === 'move') {
                const activeBoneName = selectedBones[selectedBones.length - 1];
-               const activeBone = stateRef.current.bonesMap[activeBoneName];
-               if (activeBone && activeBoneName === robotData.rootLink) {
+               const realBoneName = activeBoneName?.startsWith(robotData.rootLink + '_') ? robotData.rootLink : activeBoneName;
+               const activeBone = stateRef.current.bonesMap[realBoneName];
+               
+               if (activeBone && realBoneName === robotData.rootLink) {
                    stateRef.current.transformControl.setMode(mode === 'rotate' ? 'rotate' : 'translate');
                    stateRef.current.transformControl.showX = stateRef.current.transformControl.showY = stateRef.current.transformControl.showZ = true;
                    stateRef.current.transformControl.attach(activeBone);
@@ -533,7 +1002,8 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
     },
     resetSelectedBones: () => {
       stateRef.current.selectedBones.forEach(boneName => {
-         const bone = stateRef.current.bonesMap[boneName];
+         const realBoneName = boneName.startsWith(robotData.rootLink + '_') ? robotData.rootLink : boneName;
+         const bone = stateRef.current.bonesMap[realBoneName];
          if(bone) {
              const baseR = bone.userData.baseRotation;
              if(baseR) bone.quaternion.setFromEuler(new THREE.Euler().setFromVector3(baseR));
@@ -544,8 +1014,13 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
     getAffectedBones: () => {
         if (stateRef.current.mode === 'move') {
             const activeBoneName = stateRef.current.selectedBones[stateRef.current.selectedBones.length - 1];
-            const activeBone = stateRef.current.bonesMap[activeBoneName];
-            if (!activeBone || activeBoneName === robotData.rootLink) return stateRef.current.selectedBones;
+            const realBoneName = activeBoneName?.startsWith(robotData.rootLink + '_') ? robotData.rootLink : activeBoneName;
+            const activeBone = stateRef.current.bonesMap[realBoneName];
+            
+            if (!activeBone || realBoneName === robotData.rootLink) {
+                if (realBoneName === robotData.rootLink) return ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => robotData.rootLink + ext);
+                return stateRef.current.selectedBones;
+            }
 
             const affected = new Set(stateRef.current.selectedBones);
             let current = activeBone.parent;
@@ -570,16 +1045,15 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
 
   useEffect(() => {
     const { bonesMap } = stateRef.current;
-    if (!bonesMap || Object.keys(bonesMap).length === 0) return;
-    const state = evaluateFrame(currentFrame, keyframes, robotData);
-    Object.keys(state).forEach(boneName => {
+    if (!bonesMap || Object.keys(bonesMap).length === 0 || !currentState) return;
+    Object.keys(currentState).forEach(boneName => {
         const bone = bonesMap[boneName];
         if (bone) {
-            bone.quaternion.fromArray(state[boneName].q);
-            bone.position.fromArray(state[boneName].p);
+            bone.quaternion.fromArray(currentState[boneName].q);
+            bone.position.fromArray(currentState[boneName].p);
         }
     });
-  }, [currentFrame, keyframes]);
+  }, [currentState]);
 
   useEffect(() => {
     if (!containerRef.current || !robotData) return;
@@ -613,9 +1087,6 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
     scene.add(grid);
     stateRef.current.grid = grid;
 
-    // ==========================================
-    // 🟢 质心指示器与地面投影靶心
-    // ==========================================
     const comGroup = new THREE.Group();
     scene.add(comGroup);
     
@@ -632,12 +1103,11 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
     comLine.renderOrder = 3;
     comGroup.add(comLine);
 
-    // 🔴 质心地面落点标识圈
     const comGroundMarker = new THREE.Mesh(
         new THREE.RingGeometry(0.04, 0.08, 24),
         new THREE.MeshBasicMaterial({ color: 0xff00ff, side: THREE.DoubleSide, depthTest: false })
     );
-    comGroundMarker.rotation.x = -Math.PI / 2; // 躺平在地面
+    comGroundMarker.rotation.x = -Math.PI / 2;
     comGroundMarker.renderOrder = 3;
     comGroup.add(comGroundMarker);
 
@@ -781,9 +1251,12 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
           raycaster.setFromCamera(mouse, camera);
           const intersects = raycaster.intersectObjects(interactables);
           if (intersects.length > 0 && intersects[0].object.userData.isJoint) {
-             const bName = intersects[0].object.userData.targetBone.name;
+             const realBoneName = intersects[0].object.userData.targetBone.name;
+             let bNames = [realBoneName];
+             if (realBoneName === robotData.rootLink) bNames = ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => robotData.rootLink + ext);
+             
              const prev = stateRef.current.selectedBones;
-             onSelectBone(prev.includes(bName) ? prev.filter(b => b !== bName) : [...prev, bName]);
+             onSelectBone(prev.includes(bNames[0]) ? prev.filter(b => !bNames.includes(b)) : [...prev, ...bNames]);
           }
       }
     }
@@ -807,7 +1280,9 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
                 transformControl.showZ = Math.abs(jointData.axis[2]) > 0.5;
             } else { transformControl.showX = transformControl.showY = transformControl.showZ = true; }
             transformControl.attach(joint);
-            onSelectBone([joint.name]);
+            let bNames = [joint.name];
+            if (joint.name === robotData.rootLink) bNames = ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => robotData.rootLink + ext);
+            onSelectBone(bNames);
         } else if (stateRef.current.mode === 'move' && hit.userData.isIKTarget) {
             transformControl.setMode('translate'); 
             transformControl.showX = transformControl.showY = transformControl.showZ = true;
@@ -839,7 +1314,10 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
            Object.entries(stateRef.current.bonesMap).forEach(([name, bone]) => {
                if(bone.name === robotData.rootLink || (bone.userData.jointData && bone.userData.jointData.type !== 'fixed')) {
                    const screenPos = bone.getWorldPosition(new THREE.Vector3()).project(camera);
-                   if (screenPos.x >= minX && screenPos.x <= maxX && screenPos.y >= minY && screenPos.y <= maxY && screenPos.z >= -1 && screenPos.z <= 1) newlySelected.push(name);
+                   if (screenPos.x >= minX && screenPos.x <= maxX && screenPos.y >= minY && screenPos.y <= maxY && screenPos.z >= -1 && screenPos.z <= 1) {
+                       if (name === robotData.rootLink) newlySelected.push(...['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => robotData.rootLink + ext));
+                       else newlySelected.push(name);
+                   }
                }
            });
            if (newlySelected.length > 0) onSelectBone(newlySelected); else onSelectBone([]);
@@ -857,16 +1335,18 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
 
       interactables.forEach(obj => {
          if (obj.userData.isJoint) {
-             const isSel = stateRef.current.selectedBones.includes(obj.userData.targetBone.name);
-             obj.material.color.setHex(isSel ? (obj.userData.targetBone.name === robotData.rootLink ? 0xffcc00 : 0x00ff00) : (obj.userData.targetBone.name === robotData.rootLink ? 0x886600 : 0x005500)); 
+             const realBoneName = obj.userData.targetBone.name;
+             const isSel = stateRef.current.selectedBones.some(b => (b.startsWith(robotData.rootLink + '_') ? robotData.rootLink : b) === realBoneName);
+             obj.material.color.setHex(isSel ? (realBoneName === robotData.rootLink ? 0xffcc00 : 0x00ff00) : (realBoneName === robotData.rootLink ? 0x886600 : 0x005500)); 
              obj.scale.setScalar(isSel ? 1.5 : 1.0);
          }
       });
 
       const activeBoneName = stateRef.current.selectedBones[stateRef.current.selectedBones.length - 1];
-      const activeBone = stateRef.current.bonesMap[activeBoneName];
+      const realBoneName = activeBoneName?.startsWith(robotData.rootLink + '_') ? robotData.rootLink : activeBoneName;
+      const activeBone = stateRef.current.bonesMap[realBoneName];
 
-      if (stateRef.current.mode === 'move' && !stateRef.current.isPlaying && activeBone && activeBoneName !== robotData.rootLink) {
+      if (stateRef.current.mode === 'move' && !stateRef.current.isPlaying && activeBone && realBoneName !== robotData.rootLink) {
         ikTargetMesh.visible = true;
         const targetBoneIndex = bonesArray.indexOf(targetBone);
         const effectorIndex = bonesArray.indexOf(activeBone);
@@ -952,7 +1432,6 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
               stateRef.current.comLine.geometry.attributes.position.needsUpdate = true;
               stateRef.current.comLine.computeLineDistances();
               
-              // 🔴 同步更新地面投影标靶的位置
               stateRef.current.comGroundMarker.position.set(globalCom.x, 0.005, globalCom.z);
               
               stateRef.current.comGroup.visible = true;
@@ -999,13 +1478,13 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
 });
 
 // ==========================================
-// 5. 主应用与状态统筹
+// 6. 主应用与状态统筹
 // ==========================================
 export default function App() {
   const [theme, setTheme] = useState('dark'); 
 
   const [mode, setMode] = useState('rotate'); 
-  const [selType, setSelType] = useState('free'); 
+  const [selType, setSelType] = useState('box'); 
   const [space, setSpace] = useState('local'); 
   const [ikMode, setIkMode] = useState('selected'); 
   const [showCoM, setShowCoM] = useState(false); 
@@ -1020,7 +1499,7 @@ export default function App() {
   const [activeKey, setActiveKey] = useState(null); 
   const [keyframes, setKeyframes] = useState({}); 
 
-  const [timelineSelection, setTimelineSelection] = useState(null); 
+  const [selectionBox, setSelectionBox] = useState(null); 
   const [isDraggingTimeline, setIsDraggingTimeline] = useState(false);
   const [clipboard, setClipboard] = useState(null);
 
@@ -1033,7 +1512,17 @@ export default function App() {
   const [availableURDFs, setAvailableURDFs] = useState([]);
   const [pendingFiles, setPendingFiles] = useState([]);
   const [isURDFModalOpen, setIsURDFModalOpen] = useState(false);
-  const [isImporting, setIsImporting] = useState(false);
+  
+  const [progressTask, setProgressTask] = useState(null); 
+
+  const [bottomTab, setBottomTab] = useState('curve');
+  
+  const [isBaseExpanded, setIsBaseExpanded] = useState(false);
+
+  const currentState = useMemo(() => {
+      if (!robotData) return {};
+      return evaluateFrame(currentFrame, keyframes, robotData);
+  }, [currentFrame, keyframes, robotData]);
 
   const themeStyles = theme === 'dark' ? {
       '--bg-main': '#1e1e1e', '--bg-panel': '#252526', '--bg-header': '#333333', 
@@ -1043,14 +1532,17 @@ export default function App() {
   } : {
       '--bg-main': '#f0f0f0', '--bg-panel': '#ffffff', '--bg-header': '#e8e8e8', 
       '--border': '#cccccc', '--text-main': '#333333', '--text-muted': '#666666', '--text-highlight': '#000000',
-      '--bg-hover': '#f5f5f5', '--bg-selected': '#d0d0d0', '--accent': '#005a9e',
+      '--bg-hover': '#e4e4e4', '--bg-selected': '#d0d0d0', '--accent': '#005a9e',
       '--bg-btn': '#ffffff', '--bg-btn-hover': '#f0f0f0', '--text-btn': '#333333'
   };
 
   useEffect(() => {
       const mockRobotData = parseURDF(MOCK_URDF_XML);
       const joints = Object.values(mockRobotData.joints).filter(j => j.type !== 'fixed').map(j => j.child);
-      const allTimelineBones = [mockRobotData.rootLink, ...joints];
+      
+      const rootAxes = ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => mockRobotData.rootLink + ext);
+      const allTimelineBones = [...rootAxes, ...joints];
+      
       setActiveJoints(allTimelineBones);
       setSelectedBones([allTimelineBones[0]]);
       setRobotData(mockRobotData);
@@ -1074,26 +1566,63 @@ export default function App() {
         const urdfText = await urdfFile.text();
         const newRobotData = parseURDF(urdfText);
         const joints = Object.values(newRobotData.joints).filter(j => j.type !== 'fixed').map(j => j.child);
-        const allTimelineBones = [newRobotData.rootLink, ...joints]; 
+        const rootAxes = ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].map(ext => newRobotData.rootLink + ext);
+        const allTimelineBones = [...rootAxes, ...joints]; 
         setFileMap(newFileMap); setRobotData(newRobotData); setActiveJoints(allTimelineBones);
         if (allTimelineBones.length > 0) setSelectedBones([allTimelineBones[0]]);
         setKeyframes({}); setCurrentFrame(0);
     } catch (error) { alert("URDF 解析失败！"); }
   };
 
-  useEffect(() => { if (currentFrame > totalFrames) setCurrentFrame(totalFrames); }, [totalFrames]);
+  const visibleJoints = useMemo(() => {
+      if (!robotData) return [];
+      const res = [robotData.rootLink]; 
+      activeJoints.forEach(b => {
+          if (b.startsWith(robotData.rootLink + '_')) {
+              if (isBaseExpanded) res.push(b);
+          } else {
+              res.push(b);
+          }
+      });
+      return res;
+  }, [activeJoints, robotData, isBaseExpanded]);
+
   useEffect(() => {
-    const handleGlobalPointerUp = () => setIsDraggingTimeline(false);
+    const handleGlobalPointerUp = () => {
+        setIsDraggingTimeline(false);
+        setSelectionBox(prev => {
+            if (prev) {
+                const minB = Math.min(prev.startBone, prev.endBone);
+                const maxB = Math.max(prev.startBone, prev.endBone);
+                const newSelectedBones = new Set();
+                for (let i = minB; i <= maxB; i++) {
+                    const vBone = visibleJoints[i];
+                    if (vBone === robotData.rootLink) {
+                        ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].forEach(ext => newSelectedBones.add(robotData.rootLink + ext));
+                    } else {
+                        newSelectedBones.add(vBone);
+                    }
+                }
+                setSelectedBones(Array.from(newSelectedBones));
+            }
+            return prev;
+        });
+    };
     window.addEventListener('pointerup', handleGlobalPointerUp);
     return () => window.removeEventListener('pointerup', handleGlobalPointerUp);
-  }, []);
+  }, [visibleJoints, robotData]);
+
+  useEffect(() => { if (currentFrame > totalFrames) setCurrentFrame(totalFrames); }, [totalFrames]);
   useEffect(() => {
     if (!isPlaying) return;
     const timer = setInterval(() => setCurrentFrame(prev => (prev >= totalFrames ? 0 : prev + 1)), 1000 / 30);
     return () => clearInterval(timer);
   }, [isPlaying, totalFrames]);
 
-  const selectAll = () => setSelectedBones([...activeJoints]);
+  const selectAll = () => { 
+      setSelectedBones([...activeJoints]); 
+      setSelectionBox(null); 
+  };
 
   const handleRegisterKeyframe = () => {
     if (!viewportRef.current || selectedBones.length === 0) return;
@@ -1103,9 +1632,27 @@ export default function App() {
     setKeyframes(prev => {
       const nextDict = { ...prev };
       bonesToRegister.forEach(bone => {
-        if (!nextDict[bone]) nextDict[bone] = {};
-        const existingCurve = nextDict[bone][currentFrame]?.c || [0.25, 0.25, 0.75, 0.75]; 
-        nextDict[bone] = { ...nextDict[bone], [currentFrame]: { v: currentStates[bone].v, p: currentStates[bone].p, c: existingCurve } };
+        const isRootAxis = bone.startsWith(robotData.rootLink + '_');
+        if (isRootAxis) {
+            const realBoneName = robotData.rootLink;
+            const state = currentStates[realBoneName];
+            const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion().fromArray(state.v), 'ZYX');
+            let val = 0;
+            if (bone.endsWith('_px')) val = state.p[0];
+            if (bone.endsWith('_py')) val = state.p[1];
+            if (bone.endsWith('_pz')) val = state.p[2];
+            if (bone.endsWith('_rx')) val = euler.x;
+            if (bone.endsWith('_ry')) val = euler.y;
+            if (bone.endsWith('_rz')) val = euler.z;
+            
+            if (!nextDict[bone]) nextDict[bone] = {};
+            const existingCurve = nextDict[bone][currentFrame]?.c || [0.25, 0.25, 0.75, 0.75]; 
+            nextDict[bone] = { ...nextDict[bone], [currentFrame]: { v: val, c: existingCurve } };
+        } else {
+            if (!nextDict[bone]) nextDict[bone] = {};
+            const existingCurve = nextDict[bone][currentFrame]?.c || [0.25, 0.25, 0.75, 0.75]; 
+            nextDict[bone] = { ...nextDict[bone], [currentFrame]: { v: currentStates[bone].v, p: currentStates[bone].p, c: existingCurve } };
+        }
       });
       return nextDict;
     });
@@ -1113,38 +1660,48 @@ export default function App() {
 
   const handleReset = () => { if (viewportRef.current) viewportRef.current.resetSelectedBones(); };
 
-  const getSelectionBounds = () => {
-    if (!timelineSelection) return null;
-    return {
-      minBone: Math.min(timelineSelection.startBone, timelineSelection.endBone), maxBone: Math.max(timelineSelection.startBone, timelineSelection.endBone),
-      minFrame: Math.min(timelineSelection.startFrame, timelineSelection.endFrame), maxFrame: Math.max(timelineSelection.startFrame, timelineSelection.endFrame),
-    };
+  const getActualBonesFromSelection = () => {
+      if (!selectionBox) return [];
+      const minB = Math.min(selectionBox.startBone, selectionBox.endBone);
+      const maxB = Math.max(selectionBox.startBone, selectionBox.endBone);
+      const actualBones = new Set();
+      for (let i = minB; i <= maxB; i++) {
+          const vBone = visibleJoints[i];
+          if (vBone === robotData.rootLink) {
+              ['_px', '_py', '_pz', '_rx', '_ry', '_rz'].forEach(ext => actualBones.add(robotData.rootLink + ext));
+          } else {
+              actualBones.add(vBone);
+          }
+      }
+      return Array.from(actualBones);
   };
 
   const handleCopyFrames = () => {
-    const bounds = getSelectionBounds(); if (!bounds) return;
+    if (!selectionBox) return;
+    const actualBones = getActualBonesFromSelection();
+    const minF = Math.min(selectionBox.startFrame, selectionBox.endFrame);
+    const maxF = Math.max(selectionBox.startFrame, selectionBox.endFrame);
+    
     const newClipboard = [];
-    for (let b = bounds.minBone; b <= bounds.maxBone; b++) {
-      const boneName = activeJoints[b];
-      for (let f = bounds.minFrame; f <= bounds.maxFrame; f++) {
+    actualBones.forEach(boneName => {
+      const bIdx = activeJoints.indexOf(boneName);
+      for (let f = minF; f <= maxF; f++) {
         if (keyframes[boneName] && keyframes[boneName][f]) {
-          newClipboard.push({ boneOffset: b - bounds.minBone, frameOffset: f - bounds.minFrame, data: JSON.parse(JSON.stringify(keyframes[boneName][f])) });
+          newClipboard.push({ boneOffset: bIdx, frameOffset: f - minF, data: JSON.parse(JSON.stringify(keyframes[boneName][f])) });
         }
       }
-    }
+    });
     setClipboard(newClipboard);
   };
 
   const handlePasteFrames = () => {
     if (!clipboard || clipboard.length === 0) return;
-    const bounds = getSelectionBounds();
-    const targetBoneIdx = bounds ? bounds.minBone : Math.max(0, activeJoints.indexOf(selectedBones[0]));
     setKeyframes(prev => {
       const nextDict = { ...prev };
       clipboard.forEach(item => {
-        const bIdx = targetBoneIdx + item.boneOffset; const f = currentFrame + item.frameOffset;
-        if (bIdx >= 0 && bIdx < activeJoints.length && f <= totalFrames) {
-          const bName = activeJoints[bIdx];
+        const f = currentFrame + item.frameOffset;
+        if (item.boneOffset >= 0 && item.boneOffset < activeJoints.length && f <= totalFrames) {
+          const bName = activeJoints[item.boneOffset];
           if (!nextDict[bName]) nextDict[bName] = {};
           nextDict[bName][f] = JSON.parse(JSON.stringify(item.data));
         }
@@ -1154,140 +1711,163 @@ export default function App() {
   };
 
   const handleDeleteSelectedFrames = () => {
-    const bounds = getSelectionBounds(); if (!bounds) return;
+    if (!selectionBox) return;
+    const actualBones = getActualBonesFromSelection();
+    const minF = Math.min(selectionBox.startFrame, selectionBox.endFrame);
+    const maxF = Math.max(selectionBox.startFrame, selectionBox.endFrame);
+
     setKeyframes(prev => {
       const nextDict = { ...prev };
-      for (let b = bounds.minBone; b <= bounds.maxBone; b++) {
-        const boneName = activeJoints[b];
+      actualBones.forEach(boneName => {
         if (nextDict[boneName]) {
           const newBoneKeys = { ...nextDict[boneName] };
-          for (let f = bounds.minFrame; f <= bounds.maxFrame; f++) delete newBoneKeys[f];
+          for (let f = minF; f <= maxF; f++) delete newBoneKeys[f];
           nextDict[boneName] = newBoneKeys;
         }
-      }
+      });
       return nextDict;
     });
   };
 
   const handleSelectBoneRange = (startFrame, endFrame) => {
     if (selectedBones.length === 0) return;
-    const indices = selectedBones.map(b => activeJoints.indexOf(b));
-    const safeStart = Math.min(startFrame, endFrame); const safeEnd = Math.max(startFrame, endFrame);
-    setTimelineSelection({ startBone: Math.min(...indices), endBone: Math.max(...indices), startFrame: Math.max(0, safeStart), endFrame: Math.min(totalFrames, safeEnd) });
+    
+    const indices = [];
+    selectedBones.forEach(b => {
+        let vIdx = visibleJoints.indexOf(b);
+        if (vIdx === -1 && b.startsWith(robotData.rootLink + '_') && !isBaseExpanded) vIdx = visibleJoints.indexOf(robotData.rootLink);
+        if (vIdx !== -1) indices.push(vIdx);
+    });
+
+    if (indices.length > 0) {
+        const safeStart = Math.min(startFrame, endFrame); 
+        const safeEnd = Math.max(startFrame, endFrame);
+        setSelectionBox({ startBone: Math.min(...indices), endBone: Math.max(...indices), startFrame: Math.max(0, safeStart), endFrame: Math.min(totalFrames, safeEnd) });
+    }
   };
 
-  const handleExportCSV = () => {
+  const handleExportCSV = async () => {
     if (!robotData) return;
-    setIsImporting(true);
-    setTimeout(() => {
-        const csvHeaders = ["x", "y", "z", "qx", "qy", "qz", "qw"];
-        const jointLinkNames = [];
-        Object.values(robotData.joints).forEach(j => {
-            if (j.type !== 'fixed') {
-                jointLinkNames.push(j.child);
-                csvHeaders.push(j.name);
-            }
-        });
-        
-        let csvContent = csvHeaders.join(",") + "\n";
-        for (let f = 0; f <= totalFrames; f++) {
-          const state = evaluateFrame(f, keyframes, robotData);
-          const rootState = state[robotData.rootLink] || { q: [0,0,0,1], p: [0,0,0] };
-          let row = `${rootState.p.join(',')},${rootState.q.join(',')}`;
-          
-          jointLinkNames.forEach(linkName => {
-             const qArray = state[linkName]?.q || [0,0,0,1];
-             const qTotal = new THREE.Quaternion().fromArray(qArray);
-             const jointData = robotData.joints[linkName];
-             
-             const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
-             const qJoint = qOrigin.clone().invert().multiply(qTotal);
-             const axisVec = new THREE.Vector3(...jointData.axis).normalize();
-             
-             const sinHalfTheta = qJoint.x * axisVec.x + qJoint.y * axisVec.y + qJoint.z * axisVec.z;
-             const cosHalfTheta = qJoint.w;
-             let angle = 2 * Math.atan2(sinHalfTheta, cosHalfTheta);
-             while (angle > Math.PI) angle -= 2 * Math.PI;
-             while (angle < -Math.PI) angle += 2 * Math.PI;
+    setProgressTask({ title: "初始化导出任务...", percent: 0 });
+    await new Promise(r => setTimeout(r, 50));
 
-             row += `,${angle.toFixed(6)}`;
-          });
-          csvContent += row + "\n";
+    const csvHeaders = ["x", "y", "z", "qx", "qy", "qz", "qw"];
+    const jointLinkNames = [];
+    Object.values(robotData.joints).forEach(j => {
+        if (j.type !== 'fixed') {
+            jointLinkNames.push(j.child);
+            csvHeaders.push(j.name);
         }
-        
-        const blob = new Blob([csvContent], { type: 'text/csv' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = 'trajectory.csv'; a.click();
-        setIsImporting(false);
-    }, 50);
+    });
+    
+    let csvContent = csvHeaders.join(",") + "\n";
+    for (let f = 0; f <= totalFrames; f++) {
+      const state = evaluateFrame(f, keyframes, robotData);
+      const rootState = state[robotData.rootLink] || { q: [0,0,0,1], p: [0,0,0] };
+      let row = `${rootState.p.join(',')},${rootState.q.join(',')}`;
+      
+      jointLinkNames.forEach(linkName => {
+         const qArray = state[linkName]?.q || [0,0,0,1];
+         const qTotal = new THREE.Quaternion().fromArray(qArray);
+         const jointData = robotData.joints[linkName];
+         const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
+         const qJoint = qOrigin.clone().invert().multiply(qTotal);
+         const axisVec = new THREE.Vector3(...jointData.axis).normalize();
+         const sinHalfTheta = qJoint.x * axisVec.x + qJoint.y * axisVec.y + qJoint.z * axisVec.z;
+         const cosHalfTheta = qJoint.w;
+         let angle = 2 * Math.atan2(sinHalfTheta, cosHalfTheta);
+         while (angle > Math.PI) angle -= 2 * Math.PI;
+         while (angle < -Math.PI) angle += 2 * Math.PI;
+         row += `,${angle.toFixed(6)}`;
+      });
+      csvContent += row + "\n";
+
+      if (f % 50 === 0) {
+          setProgressTask({ title: `正在生成 CSV 数据 (${f}/${totalFrames})...`, percent: Math.round((f / totalFrames) * 100) });
+          await new Promise(r => setTimeout(r, 0));
+      }
+    }
+    
+    const blob = new Blob([csvContent], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'trajectory.csv'; a.click();
+    setProgressTask(null);
   };
 
-  const handleImportCSV = (event) => {
+  const handleImportCSV = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
     
-    setIsImporting(true);
-    setTimeout(async () => {
-        try {
-            const text = await file.text();
-            const lines = text.trim().split('\n');
-            if (lines.length < 2) throw new Error("CSV格式错误或文件过短");
-            
-            const headers = lines[0].split(',').map(s => s.trim());
-            let startIndex = 1;
-            if (!isNaN(parseFloat(headers[0]))) startIndex = 0; 
-            
-            const dataLines = lines.slice(startIndex).filter(l => l.trim().length > 0);
-            const newTotalFrames = dataLines.length - 1; 
-            setTotalFrames(Math.max(10, newTotalFrames));
-            
-            const newKeyframes = {};
-            newKeyframes[robotData.rootLink] = {};
+    setProgressTask({ title: "读取并解析 CSV 文件...", percent: 0 });
+    await new Promise(r => setTimeout(r, 50));
 
-            const orderedJointLinks = [];
-            Object.values(robotData.joints).forEach(j => {
-                if (j.type !== 'fixed') orderedJointLinks.push(j.child);
-            });
+    try {
+        const text = await file.text();
+        const lines = text.trim().split('\n');
+        if (lines.length < 2) throw new Error("CSV格式错误或文件过短");
+        
+        const headers = lines[0].split(',').map(s => s.trim());
+        let startIndex = 1;
+        if (!isNaN(parseFloat(headers[0]))) startIndex = 0; 
+        
+        const dataLines = lines.slice(startIndex).filter(l => l.trim().length > 0);
+        const newTotalFrames = dataLines.length - 1; 
+        setTotalFrames(Math.max(10, newTotalFrames));
+        
+        const newKeyframes = {};
 
-            const jointCache = orderedJointLinks.map(linkName => {
-                const jointData = robotData.joints[linkName];
-                const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
-                const axisVec = new THREE.Vector3(...jointData.axis).normalize();
-                newKeyframes[linkName] = {};
-                return { linkName, qOrigin, axisVec, xyz: [...jointData.xyz] };
-            });
-            
-            for (let i = 0; i < dataLines.length; i++) {
-              const frame = i;
-              const values = dataLines[i].split(',').map(Number);
-              if (values.length < 7) continue;
-              
-              const [px, py, pz, qx, qy, qz, qw] = values;
-              newKeyframes[robotData.rootLink][frame] = { v: [qx, qy, qz, qw], p: [px, py, pz], c: [0.25, 0.25, 0.75, 0.75] };
-              
-              jointCache.forEach((cache, idx) => {
-                 const angle = values[7 + idx];
-                 if (isNaN(angle)) return;
-                 const qJoint = new THREE.Quaternion().setFromAxisAngle(cache.axisVec, angle);
-                 const qTotal = cache.qOrigin.clone().multiply(qJoint);
-                 
-                 newKeyframes[cache.linkName][frame] = { 
-                     v: [qTotal.x, qTotal.y, qTotal.z, qTotal.w], 
-                     p: cache.xyz, 
-                     c: [0.25, 0.25, 0.75, 0.75] 
-                 };
-              });
-            }
-            setKeyframes(newKeyframes);
-            setCurrentFrame(0);
-        } catch (e) {
-            console.error(e);
-            alert("导入失败: " + e.message);
-        } finally {
-            setIsImporting(false);
-            event.target.value = '';
+        const orderedJointLinks = [];
+        Object.values(robotData.joints).forEach(j => {
+            if (j.type !== 'fixed') orderedJointLinks.push(j.child);
+        });
+
+        const jointCache = orderedJointLinks.map(linkName => {
+            const jointData = robotData.joints[linkName];
+            const qOrigin = new THREE.Quaternion().setFromEuler(new THREE.Euler(jointData.rpy[0], jointData.rpy[1], jointData.rpy[2], 'ZYX'));
+            const axisVec = new THREE.Vector3(...jointData.axis).normalize();
+            newKeyframes[linkName] = {};
+            return { linkName, qOrigin, axisVec, xyz: [...jointData.xyz] };
+        });
+        
+        ['px', 'py', 'pz', 'rx', 'ry', 'rz'].forEach(ext => newKeyframes[robotData.rootLink + '_' + ext] = {});
+
+        for (let i = 0; i < dataLines.length; i++) {
+          const frame = i;
+          const values = dataLines[i].split(',').map(Number);
+          if (values.length < 7) continue;
+          
+          const [px, py, pz, qx, qy, qz, qw] = values;
+          const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(qx, qy, qz, qw), 'ZYX');
+          
+          newKeyframes[`${robotData.rootLink}_px`][frame] = { v: px, c: [0.25, 0.25, 0.75, 0.75] };
+          newKeyframes[`${robotData.rootLink}_py`][frame] = { v: py, c: [0.25, 0.25, 0.75, 0.75] };
+          newKeyframes[`${robotData.rootLink}_pz`][frame] = { v: pz, c: [0.25, 0.25, 0.75, 0.75] };
+          newKeyframes[`${robotData.rootLink}_rx`][frame] = { v: euler.x, c: [0.25, 0.25, 0.75, 0.75] };
+          newKeyframes[`${robotData.rootLink}_ry`][frame] = { v: euler.y, c: [0.25, 0.25, 0.75, 0.75] };
+          newKeyframes[`${robotData.rootLink}_rz`][frame] = { v: euler.z, c: [0.25, 0.25, 0.75, 0.75] };
+          
+          jointCache.forEach((cache, idx) => {
+             const angle = values[7 + idx];
+             if (isNaN(angle)) return;
+             const qJoint = new THREE.Quaternion().setFromAxisAngle(cache.axisVec, angle);
+             const qTotal = cache.qOrigin.clone().multiply(qJoint);
+             newKeyframes[cache.linkName][frame] = { v: [qTotal.x, qTotal.y, qTotal.z, qTotal.w], p: cache.xyz, c: [0.25, 0.25, 0.75, 0.75] };
+          });
+
+          if (i % 100 === 0) {
+              setProgressTask({ title: `正在重组姿态轨道 (${i}/${dataLines.length})...`, percent: Math.round((i / dataLines.length) * 100) });
+              await new Promise(r => setTimeout(r, 0));
+          }
         }
-    }, 50);
+        setKeyframes(newKeyframes);
+        setCurrentFrame(0);
+    } catch (e) {
+        console.error(e);
+        alert("导入失败: " + e.message);
+    } finally {
+        setProgressTask(null);
+        event.target.value = '';
+    }
   };
 
   const currentActiveCurve = activeKey ? (keyframes[activeKey.bone]?.[activeKey.frame]?.c || [0.25, 0.25, 0.75, 0.75]) : [0.25, 0.25, 0.75, 0.75];
@@ -1300,10 +1880,16 @@ export default function App() {
   return (
     <div style={themeStyles} className="flex w-full h-screen bg-[var(--bg-main)] text-[var(--text-main)] overflow-hidden font-sans select-none relative transition-colors duration-300">
       
-      {isImporting && (
+      {progressTask && (
          <div className="fixed inset-0 bg-black/80 z-[100] flex flex-col items-center justify-center">
             <div className="w-12 h-12 border-4 border-[#007acc] border-t-transparent rounded-full animate-spin"></div>
-            <div className="mt-4 text-white font-bold tracking-widest text-sm">正在处理大规模数据...</div>
+            <div className="mt-4 text-white font-bold tracking-widest text-sm">{progressTask.title}</div>
+            {progressTask.percent !== null && (
+                <div className="w-64 h-1.5 bg-[#333] mt-4 rounded overflow-hidden shadow-inner">
+                    <div className="h-full bg-[#007acc] transition-all duration-100 ease-linear" style={{ width: `${progressTask.percent}%` }}></div>
+                </div>
+            )}
+            {progressTask.percent !== null && <div className="text-[10px] text-gray-400 mt-1.5 font-mono">{progressTask.percent}%</div>}
          </div>
       )}
 
@@ -1361,19 +1947,38 @@ export default function App() {
         </div>
       )}
 
-      <div className="w-[40%] min-w-[350px] flex flex-col border-r border-[var(--border)] bg-[var(--bg-panel)] pt-12">
+      <div className="w-[40%] min-w-[380px] flex flex-col border-r border-[var(--border)] bg-[var(--bg-panel)] pt-12">
         <Timeline 
-           theme={theme} robotData={robotData} boneNames={activeJoints}
+           theme={theme} robotData={robotData} boneNames={activeJoints} visibleJoints={visibleJoints} 
+           isBaseExpanded={isBaseExpanded} setIsBaseExpanded={setIsBaseExpanded}
            totalFrames={totalFrames} setTotalFrames={setTotalFrames} onRequestChangeTotalFrames={() => { setTempFramesInput(totalFrames); setIsFramesModalOpen(true); }}
            currentFrame={currentFrame} setCurrentFrame={setCurrentFrame} keyframes={keyframes}
+           currentState={currentState} 
            selectedBones={selectedBones} onSelectBone={setSelectedBones} activeKey={activeKey} setActiveKey={setActiveKey}
-           selectionBox={timelineSelection} setSelectionBox={setTimelineSelection} isDraggingTimeline={isDraggingTimeline} setIsDraggingTimeline={setIsDraggingTimeline}
+           selectionBox={selectionBox} setSelectionBox={setSelectionBox} isDraggingTimeline={isDraggingTimeline} setIsDraggingTimeline={setIsDraggingTimeline}
            clipboard={clipboard} onCopy={handleCopyFrames} onPaste={handlePasteFrames} onDelete={handleDeleteSelectedFrames} onSelectBoneRange={handleSelectBoneRange}
            isPlaying={isPlaying} setIsPlaying={setIsPlaying} onStart={() => setCurrentFrame(0)} onEnd={() => setCurrentFrame(totalFrames)}
            onPrevKey={() => { const frames = getAllKeyframeNums(); const prev = frames.reverse().find(f => f < currentFrame); setCurrentFrame(prev !== undefined ? prev : 0); }}
            onNextKey={() => { const frames = getAllKeyframeNums(); const next = frames.find(f => f > currentFrame); setCurrentFrame(next !== undefined ? next : totalFrames); }}
         />
-        <CurveEditor curve={currentActiveCurve} theme={theme} onChange={(c) => { if(!activeKey) return; setKeyframes(prev => { const nd = {...prev}; selectedBones.forEach(b => { if(nd[b] && nd[b][activeKey.frame]) nd[b][activeKey.frame].c = c; }); return nd; }); }} disabled={!activeKey || activeKey.frame === 0} />
+        
+        <div className="flex-1 flex flex-col bg-[var(--bg-main)] border-t-2 border-[var(--border)] min-h-[220px]">
+            <div className="h-[32px] bg-[var(--bg-header)] px-3 text-xs font-bold border-b border-[var(--border)] flex items-center gap-4 shrink-0">
+                <button onClick={() => setBottomTab('curve')} className={`h-full px-2 transition-colors ${bottomTab === 'curve' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}>插值曲线</button>
+                <button onClick={() => setBottomTab('clean')} className={`h-full px-2 transition-colors flex items-center gap-1 ${bottomTab === 'clean' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}>
+                    🛠 数据清洗
+                </button>
+            </div>
+            
+            {bottomTab === 'curve' ? (
+                <CurveEditor curve={currentActiveCurve} theme={theme} onChange={(c) => { if(!activeKey) return; setKeyframes(prev => { const nd = {...prev}; selectedBones.forEach(b => { if(nd[b] && nd[b][activeKey.frame]) nd[b][activeKey.frame].c = c; }); return nd; }); }} disabled={!activeKey || activeKey.frame === 0} />
+            ) : (
+                <DataCleaningPanel 
+                    robotData={robotData} activeJoints={activeJoints} visibleJoints={visibleJoints} selectedBones={selectedBones} currentFrame={currentFrame} keyframes={keyframes} selectionBox={selectionBox} 
+                    totalFrames={totalFrames} setKeyframes={setKeyframes} setProgressTask={setProgressTask} theme={theme} 
+                />
+            )}
+        </div>
       </div>
 
       <div className="flex-1 flex flex-col relative bg-[var(--bg-main)]">
@@ -1389,7 +1994,7 @@ export default function App() {
              <button onClick={() => { if(mode==='select') setSelType('free') }} className={`flex-1 border border-[var(--border)] transition-colors ${mode!=='select' ? 'bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed' : (selType==='free' ? '!bg-[var(--accent)] text-white' : 'bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]')}`}>自由选择</button>
           </div>
           <div className="flex justify-between gap-1 h-6">
-             <button onClick={handleRegisterKeyframe} className="flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[#e55353] font-bold tracking-widest">注册</button>
+             <button onClick={handleRegisterKeyframe} className="flex-[2] border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[#e55353] font-bold tracking-widest">注册</button>
              <button onClick={handleReset} className="flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]">重置</button>
              <button className="flex-1 border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed">物理</button>
           </div>
@@ -1412,7 +2017,7 @@ export default function App() {
           </div>
         </div>
 
-        {robotData && <Viewport3D ref={viewportRef} theme={theme} mode={mode} selType={selType} space={space} ikMode={ikMode} showCoM={showCoM} currentFrame={currentFrame} keyframes={keyframes} isPlaying={isPlaying} selectedBones={selectedBones} onSelectBone={setSelectedBones} robotData={robotData} fileMap={fileMap} />}
+        {robotData && <Viewport3D ref={viewportRef} theme={theme} mode={mode} selType={selType} space={space} ikMode={ikMode} showCoM={showCoM} currentFrame={currentFrame} currentState={currentState} isPlaying={isPlaying} selectedBones={selectedBones} onSelectBone={(bones) => { setSelectedBones(bones); setSelectionBox(null); }} robotData={robotData} fileMap={fileMap} />}
       </div>
     </div>
   );
