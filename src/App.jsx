@@ -6,7 +6,139 @@ import { CCDIKSolver } from 'three/examples/jsm/animation/CCDIKSolver.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
 // ==========================================
-// 0. 内置超级 URDF 引擎
+// 0. 国际化 (i18n) 字典
+// ==========================================
+const i18nDict = {
+    zh: {
+        importURDF: '📂 导入 URDF 文件夹',
+        importCSV: '📥 导入 CSV',
+        exportCSV: '📤 导出 CSV',
+        loaded: '载入',
+        tutorialRepo: '教程 & 开源库',
+        noURDF: '没有找到 .urdf 文件！',
+        urdfFailed: 'URDF 解析失败！',
+        multiURDFDetected: '检测到多个 URDF 文件',
+        selectModel: '请选择要加载的模型：',
+        cancel: '取消',
+        confirm: '确定',
+        setTotalFramesTitle: '设置总帧数',
+        timeline: '帧操作记录',
+        current: '当前',
+        settings: '⚙️ 设置',
+        nodes: '节点 (Links)',
+        values: '数值',
+        curveEditor: '插值曲线',
+        dataCleaning: '🛠 数据清洗',
+        selectSecondFrame: '选中第二帧以激活',
+        spikeFilter: '滤除突变(除抖)',
+        clipPeak: '暴力削峰(限速)',
+        decimate: '语义抽稀(压缩)',
+        threshold: '阈值:',
+        tolerance: '容差:',
+        executeCleaning: '⚡ 执行清洗',
+        monitorMode: '👀 监视模式',
+        needSelection: '⚡ 需框选后执行',
+        selectTimeRangePrompt: '请在左侧点击骨骼或框选时间段以监视数据',
+        locate: '定位',
+        copy: '复制',
+        paste: '粘贴',
+        del: '删除',
+        boxSelect: '框选',
+        select: '选中',
+        rotate: '旋转',
+        move: '移动',
+        boxSelMode: '框选',
+        selectAll: '全选',
+        freeSelect: '自由选',
+        register: '注册',
+        reset: '重置',
+        physics: '物理',
+        opSettings: '操作设置',
+        com: '质心:',
+        on: '开',
+        off: '关',
+        ikGlobal: '链式',
+        ikLocal: '局部',
+        ikHover: '全局: IK追溯至根节点\n选中: IK仅在已框选的关节之间起效',
+        axisComp: '轴分量',
+        initClean: '初始化清洗引擎...',
+        cleaningTrack: '正在清洗轨道:',
+        mergeData: '整合时间轴数据...',
+        initExport: '初始化导出任务...',
+        generatingCSV: '正在生成 CSV 数据',
+        readParseCSV: '读取并解析 CSV 文件...',
+        csvFormatErr: 'CSV格式错误或文件过短',
+        rebuildMatrix: '正在重组姿态轨道',
+        importFailed: '导入失败:',
+        processingMassiveData: '正在处理大规模数据...'
+    },
+    en: {
+        importURDF: '📂 Import URDF Dir',
+        importCSV: '📥 Import CSV',
+        exportCSV: '📤 Export CSV',
+        loaded: 'Loaded',
+        tutorialRepo: 'Tutorial & GitHub',
+        noURDF: 'No .urdf file found!',
+        urdfFailed: 'URDF Parsing Failed!',
+        multiURDFDetected: 'Multiple URDF files detected',
+        selectModel: 'Please select a model to load:',
+        cancel: 'Cancel',
+        confirm: 'Confirm',
+        setTotalFramesTitle: 'Set Total Frames',
+        timeline: 'Timeline',
+        current: 'Current',
+        settings: '⚙️ Setup',
+        nodes: 'Links',
+        values: 'Values',
+        curveEditor: 'Curve Editor',
+        dataCleaning: '🛠 Data Cleaning',
+        selectSecondFrame: 'Select 2nd frame to activate',
+        spikeFilter: 'Spike Filter',
+        clipPeak: 'Slew Rate Limit',
+        decimate: 'Decimate (Compress)',
+        threshold: 'Threshold:',
+        tolerance: 'Tolerance:',
+        executeCleaning: '⚡ Execute',
+        monitorMode: '👀 Monitor Mode',
+        needSelection: '⚡ Select to Execute',
+        selectTimeRangePrompt: 'Select a bone or time range to monitor data',
+        locate: 'Locate',
+        copy: 'Copy',
+        paste: 'Paste',
+        del: 'Delete',
+        boxSelect: 'Box Sel',
+        select: 'Select',
+        rotate: 'Rotate',
+        move: 'Translate',
+        boxSelMode: 'Box Sel',
+        selectAll: 'Sel All',
+        freeSelect: 'Free Sel',
+        register: 'Keyframe',
+        reset: 'Reset',
+        physics: 'Physics',
+        opSettings: 'Settings',
+        com: 'CoM:',
+        on: 'ON',
+        off: 'OFF',
+        ikGlobal: 'Global',
+        ikLocal: 'Local',
+        ikHover: 'Global: IK traces to root\nLocal: IK only works on selected joints',
+        axisComp: 'Axis',
+        initClean: 'Initializing engine...',
+        cleaningTrack: 'Cleaning track:',
+        mergeData: 'Merging timeline data...',
+        initExport: 'Initializing export...',
+        generatingCSV: 'Generating CSV data',
+        readParseCSV: 'Reading & parsing CSV...',
+        csvFormatErr: 'CSV format error or file too short',
+        rebuildMatrix: 'Rebuilding pose tracks',
+        importFailed: 'Import failed:',
+        processingMassiveData: 'Processing massive data...'
+    }
+};
+
+// ==========================================
+// 1. 内置超级 URDF 引擎
 // ==========================================
 const MOCK_URDF_XML = `
 <robot name="Placeholder_Bot">
@@ -103,7 +235,7 @@ function clampJoint(bone, jointData) {
 }
 
 // ==========================================
-// 1. 核心数学与高维数据清洗引擎 (极致缓存优化版)
+// 2. 核心数学与高维数据清洗引擎
 // ==========================================
 function cubicBezier(t, p0, p1, p2, p3) { return (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 + 3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3; }
 function solveBezier(x, x1, y1, x2, y2) {
@@ -305,9 +437,9 @@ const IconPlay = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="non
 const IconPause = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>;
 
 // ==========================================
-// 2. 曲线编辑器组件
+// 3. 曲线编辑器组件
 // ==========================================
-const CurveEditor = ({ curve, onChange, disabled, theme }) => {
+const CurveEditor = ({ curve, onChange, disabled, theme, t }) => {
   const canvasRef = useRef(null);
   const [dragging, setDragging] = useState(0); 
 
@@ -319,7 +451,7 @@ const CurveEditor = ({ curve, onChange, disabled, theme }) => {
     if (disabled) { 
         ctx.fillStyle = theme === 'dark' ? '#555' : '#aaa'; 
         ctx.font = '12px sans-serif'; ctx.textAlign = 'center'; 
-        ctx.fillText('选中第二帧以激活', canvas.width / 2, canvas.height / 2); return; 
+        ctx.fillText(t('selectSecondFrame'), canvas.width / 2, canvas.height / 2); return; 
     }
     ctx.strokeStyle = theme === 'dark' ? '#3e3e42' : '#cccccc'; ctx.lineWidth = 1; ctx.beginPath(); 
     ctx.moveTo(0, canvas.height / 2); ctx.lineTo(canvas.width, canvas.height / 2); ctx.moveTo(canvas.width / 2, 0); ctx.lineTo(canvas.width / 2, canvas.height); ctx.stroke();
@@ -337,8 +469,8 @@ const CurveEditor = ({ curve, onChange, disabled, theme }) => {
     ctx.fillStyle = dragging === 2 ? activeColor : idleColor; ctx.fillRect(p2x - 4, p2y - 4, 8, 8);
   };
 
-  useEffect(draw, [curve, disabled, dragging, theme]);
-  useEffect(() => { window.addEventListener('resize', draw); return () => window.removeEventListener('resize', draw); }, []);
+  useEffect(draw, [curve, disabled, dragging, theme, t]);
+  useEffect(() => { window.addEventListener('resize', draw); return () => window.removeEventListener('resize', draw); }, [draw]);
 
   const handlePointerDown = (e) => {
     if (disabled) return;
@@ -364,13 +496,13 @@ const CurveEditor = ({ curve, onChange, disabled, theme }) => {
 };
 
 // ==========================================
-// 3. 🔴 全维极速数据清洗与动态示波器面板
+// 4. 数据清洗面板 (Data Cleaning Panel)
 // ==========================================
 const CHART_COLORS = ['#007acc', '#c586c0', '#4caf50', '#d32f2f', '#ff9800', '#00bcd4', '#9c27b0', '#e91e63'];
 
-const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBones, currentFrame, keyframes, selectionBox, totalFrames, setKeyframes, setProgressTask, theme }) => {
+const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBones, currentFrame, keyframes, selectionBox, totalFrames, setKeyframes, setProgressTask, theme, t }) => {
     const canvasRef = useRef(null);
-    const [cleanMode, setCleanMode] = useState('spike'); // 'spike' | 'clip' | 'decimate'
+    const [cleanMode, setCleanMode] = useState('spike'); 
     const [threshold, setThreshold] = useState(15);
     const [tolerance, setTolerance] = useState(2.0);
 
@@ -530,7 +662,7 @@ const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBon
     const execute = async () => {
         if (!robotData || !fullTrackData || fullTrackData.mode !== 'edit') return;
         
-        setProgressTask({ title: "初始化清洗引擎...", percent: 0 });
+        setProgressTask({ title: t('initClean'), percent: 0 });
         await new Promise(r => setTimeout(r, 50)); 
 
         let nextDict = { ...keyframes };
@@ -547,11 +679,10 @@ const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBon
             
             nextDict[boneName] = { ...keyframes[boneName] };
 
-            setProgressTask({ title: `正在清洗轨道: ${boneName}...`, percent: Math.round((i / bonesToProcess.length) * 100) });
+            setProgressTask({ title: `${t('cleaningTrack')} ${boneName}...`, percent: Math.round((i / bonesToProcess.length) * 100) });
             await new Promise(r => setTimeout(r, 0)); 
 
             if (cleanMode === 'spike') {
-                // 浅拷贝避免内存尖峰
                 const smoothed = points.map(p => ({ f: p.f, vals: [...p.vals], p: p.p }));
                 const windowSize = 5; 
                 const halfW = Math.floor(windowSize / 2);
@@ -577,7 +708,6 @@ const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBon
                 const clipped = points.map(p => ({ f: p.f, vals: [...p.vals], p: p.p }));
                 
                 for (let dim = 0; dim < points[0].vals.length; dim++) {
-                    // 🔴 修正算法：正反向削峰必须乘以两帧之间的差值，以适配稀疏区间
                     for (let ptIdx = 1; ptIdx < clipped.length; ptIdx++) {
                         const prev = clipped[ptIdx - 1].vals[dim];
                         const curr = clipped[ptIdx].vals[dim];
@@ -613,7 +743,7 @@ const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBon
             }
         }
 
-        setProgressTask({ title: "整合时间轴数据...", percent: 100 });
+        setProgressTask({ title: t('mergeData'), percent: 100 });
         await new Promise(r => setTimeout(r, 50));
         
         setKeyframes(nextDict);
@@ -621,7 +751,7 @@ const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBon
     };
 
     if (!fullTrackData) {
-        return <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-muted)]">请在左侧点击骨骼或框选时间段以监视数据</div>;
+        return <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-muted)]">{t('selectTimeRangePrompt')}</div>;
     }
 
     return (
@@ -643,33 +773,33 @@ const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBon
             
             <div className="h-[36px] bg-[var(--bg-header)] border-t border-[var(--border)] flex items-center px-2 gap-2 text-xs shrink-0 relative z-10">
                 <select value={cleanMode} onChange={e=>setCleanMode(e.target.value)} className="bg-[var(--bg-main)] border border-[var(--border)] text-[var(--text-main)] outline-none rounded p-1">
-                    <option value="spike">滤除突变(除抖)</option>
-                    <option value="clip">暴力削峰(限速)</option>
-                    <option value="decimate">语义抽稀(压缩)</option>
+                    <option value="spike">{t('spikeFilter')}</option>
+                    <option value="clip">{t('clipPeak')}</option>
+                    <option value="decimate">{t('decimate')}</option>
                 </select>
                 
                 {cleanMode === 'spike' || cleanMode === 'clip' ? (
                     <label className="flex items-center gap-1">
-                        <span className="text-[var(--text-muted)]">阈值:</span>
+                        <span className="text-[var(--text-muted)]">{t('threshold')}</span>
                         <input type="number" min={1} max={180} value={threshold} onChange={e=>setThreshold(Number(e.target.value))} className="w-12 bg-[var(--bg-main)] border border-[var(--border)] text-center text-[var(--text-main)] outline-none rounded p-0.5" />
                         <span className="text-[var(--text-muted)]">°/f</span>
                     </label>
                 ) : (
                     <label className="flex items-center gap-1">
-                        <span className="text-[var(--text-muted)]">容差:</span>
+                        <span className="text-[var(--text-muted)]">{t('tolerance')}</span>
                         <input type="number" min={0.1} max={45} step={0.1} value={tolerance} onChange={e=>setTolerance(Number(e.target.value))} className="w-12 bg-[var(--bg-main)] border border-[var(--border)] text-center text-[var(--text-main)] outline-none rounded p-0.5" />
                         <span className="text-[var(--text-muted)]">°</span>
                     </label>
                 )}
 
                 {fullTrackData.mode === 'edit' ? (
-                    <button onClick={execute} className="ml-auto px-3 py-1 bg-[#007acc] hover:bg-[#0098ff] text-white rounded font-bold transition-colors shadow">⚡ 执行清洗</button>
+                    <button onClick={execute} className="ml-auto px-3 py-1 bg-[#007acc] hover:bg-[#0098ff] text-white rounded font-bold transition-colors shadow whitespace-nowrap">{t('executeCleaning')}</button>
                 ) : (
                     <div className="ml-auto flex items-center gap-2">
-                        <span className="text-[10px] text-[#ff9800] bg-[#ff980022] px-2 py-0.5 rounded border border-[#ff980055]">
-                            👀 监视模式
+                        <span className="text-[10px] text-[#ff9800] bg-[#ff980022] px-2 py-0.5 rounded border border-[#ff980055] whitespace-nowrap">
+                            {t('monitorMode')}
                         </span>
-                        <button disabled className="px-3 py-1 bg-[var(--bg-hover)] text-[var(--text-muted)] rounded font-bold cursor-not-allowed border border-[var(--border)]">⚡ 需框选后执行</button>
+                        <button disabled className="px-3 py-1 bg-[var(--bg-hover)] text-[var(--text-muted)] rounded font-bold cursor-not-allowed border border-[var(--border)] whitespace-nowrap">{t('needSelection')}</button>
                     </div>
                 )}
             </div>
@@ -678,7 +808,7 @@ const DataCleaningPanel = ({ robotData, activeJoints, visibleJoints, selectedBon
 };
 
 // ==========================================
-// 4. 高性能时间轴组件
+// 5. 高性能时间轴组件
 // ==========================================
 const Timeline = ({ 
   robotData, visibleJoints, isBaseExpanded, setIsBaseExpanded, totalFrames, setTotalFrames,
@@ -687,7 +817,7 @@ const Timeline = ({
   selectedBones, onSelectBone, activeKey, setActiveKey, 
   selectionBox, setSelectionBox, isDraggingTimeline, setIsDraggingTimeline,
   clipboard, onCopy, onPaste, onDelete, onSelectBoneRange,
-  isPlaying, setIsPlaying, onStart, onEnd, onPrevKey, onNextKey, onRequestChangeTotalFrames, theme
+  isPlaying, setIsPlaying, onStart, onEnd, onPrevKey, onNextKey, onRequestChangeTotalFrames, theme, t
 }) => {
   const scrollRef = useRef(null);
   const keyframeCanvasRef = useRef(null); 
@@ -823,10 +953,10 @@ const Timeline = ({
   return (
     <div className="flex-[2] flex flex-col bg-[var(--bg-panel)] overflow-hidden min-h-[250px] relative">
       <div className="bg-[var(--bg-header)] px-3 py-1 text-xs font-bold border-b border-[var(--border)] flex justify-between items-center text-[var(--text-main)] h-[30px] shrink-0">
-        <span>帧操作记录</span>
+        <span>{t('timeline')}</span>
         <div className="flex items-center gap-2">
-          <span style={{color: 'var(--accent)'}}>当前: {currentFrame} / {totalFrames}</span>
-          <button onClick={onRequestChangeTotalFrames} className="px-2 py-0.5 bg-[var(--bg-hover)] hover:bg-[var(--border)] text-[var(--text-main)] rounded text-[10px] transition-colors">⚙️ 设置</button>
+          <span style={{color: 'var(--accent)'}}>{t('current')}: {currentFrame} / {totalFrames}</span>
+          <button onClick={onRequestChangeTotalFrames} className="px-2 py-0.5 bg-[var(--bg-hover)] hover:bg-[var(--border)] text-[var(--text-main)] rounded text-[10px] transition-colors">{t('settings')}</button>
         </div>
       </div>
       
@@ -837,13 +967,13 @@ const Timeline = ({
             <div style={{ width: `${totalFrames * 20 + 180}px`, height: `${visibleJoints.length * 24 + 24}px` }} className="relative">
                <div className="sticky top-0 h-[24px] flex z-40 bg-[var(--bg-header)] border-b border-[var(--border)]">
                   <div className="sticky left-0 w-[180px] bg-[var(--bg-header)] z-50 border-r border-[var(--border)] flex justify-between items-center px-2 text-xs font-bold text-[var(--text-main)]" onPointerDown={e=>e.stopPropagation()}>
-                      <span>节点 (Links)</span>
+                      <span>{t('nodes')}</span>
                       <span 
                           className="text-[9px] text-[var(--text-muted)] font-normal cursor-pointer hover:text-[var(--text-highlight)] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] transition-colors" 
                           onClick={() => setAngleUnit(u => u === 'degree' ? 'radian' : 'degree')}
-                          title="点击切换 角度(°)/弧度(rad)"
+                          title="Degree(°) / Radian(rad)"
                       >
-                          数值({angleUnit === 'degree' ? '°' : 'rad'})
+                          {t('values')}({angleUnit === 'degree' ? '°' : 'rad'})
                       </span>
                   </div>
                   <div className="flex-1 relative" style={{ backgroundImage: `repeating-linear-gradient(to right, transparent, transparent 19px, var(--border) 19px, var(--border) 20px)` }}>
@@ -878,7 +1008,7 @@ const Timeline = ({
                          }
                      }
 
-                     const shortName = isRootAxis ? `${bone.split('_').pop().toUpperCase()} 轴分量` : bone;
+                     const shortName = isRootAxis ? `${bone.split('_').pop().toUpperCase()}` : bone;
 
                      return (
                        <div key={bone} style={{backgroundColor: isSelected ? 'var(--bg-selected)' : 'transparent'}} className={`flex h-[24px] border-b border-[var(--border)] hover:bg-[var(--bg-hover)] transition-colors`}>
@@ -910,16 +1040,16 @@ const Timeline = ({
       </div>
 
       <div className="h-[32px] bg-[var(--bg-header)] border-t border-[var(--border)] flex items-center px-2 gap-1.5 text-xs text-[var(--text-main)] z-40 relative overflow-x-auto whitespace-nowrap shrink-0">
-        <button onClick={handleScrollToCurrent} className="px-2 py-0.5 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[var(--text-btn)] rounded border border-[var(--border)] text-[11px]">定位</button>
+        <button onClick={handleScrollToCurrent} className="px-2 py-0.5 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[var(--text-btn)] rounded border border-[var(--border)] text-[11px] whitespace-nowrap">{t('locate')}</button>
         <div className="w-px h-3 bg-[var(--text-muted)] mx-0.5" />
-        <button onClick={onCopy} className="px-2 py-0.5 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[var(--text-btn)] rounded border border-[var(--border)] text-[11px]">复制</button>
-        <button onClick={onPaste} disabled={!clipboard || clipboard.length === 0} className={`px-2 py-0.5 rounded text-[11px] border border-[var(--border)] ${clipboard?.length > 0 ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-btn)] text-[var(--text-muted)] cursor-not-allowed'}`}>粘贴</button>
-        <button onClick={onDelete} className="px-2 py-0.5 bg-[#d32f2f] hover:bg-[#b71c1c] text-white rounded text-[11px]">删除</button>
+        <button onClick={onCopy} className="px-2 py-0.5 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[var(--text-btn)] rounded border border-[var(--border)] text-[11px] whitespace-nowrap">{t('copy')}</button>
+        <button onClick={onPaste} disabled={!clipboard || clipboard.length === 0} className={`px-2 py-0.5 rounded text-[11px] border border-[var(--border)] whitespace-nowrap ${clipboard?.length > 0 ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-btn)] text-[var(--text-muted)] cursor-not-allowed'}`}>{t('paste')}</button>
+        <button onClick={onDelete} className="px-2 py-0.5 bg-[#d32f2f] hover:bg-[#b71c1c] text-white rounded text-[11px] whitespace-nowrap">{t('del')}</button>
         <div className="flex items-center gap-1 ml-auto">
           <input type="number" min={0} max={totalFrames} value={rangeStart} onChange={(e) => setRangeStart(Number(e.target.value))} className="w-10 bg-[var(--bg-main)] border border-[var(--border)] rounded text-[var(--text-main)] text-center text-[10px] outline-none p-0.5" />
           <span className="text-[10px] text-[var(--text-muted)]">-</span>
           <input type="number" min={0} max={totalFrames} value={rangeEnd} onChange={(e) => setRangeEnd(Number(e.target.value))} className="w-10 bg-[var(--bg-main)] border border-[var(--border)] rounded text-[var(--text-main)] text-center text-[10px] outline-none p-0.5" />
-          <button onClick={() => onSelectBoneRange(rangeStart, rangeEnd)} className="px-2 py-0.5 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[var(--text-btn)] border border-[var(--border)] rounded text-[11px]">框选</button>
+          <button onClick={() => onSelectBoneRange(rangeStart, rangeEnd)} className="px-2 py-0.5 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[var(--text-btn)] border border-[var(--border)] rounded text-[11px] whitespace-nowrap">{t('boxSelect')}</button>
         </div>
       </div>
       <div className="h-[40px] bg-[var(--bg-panel)] border-t border-[var(--border)] flex items-center justify-center gap-2 text-[var(--text-main)] z-40 relative shrink-0">
@@ -936,7 +1066,7 @@ const Timeline = ({
 };
 
 // ==========================================
-// 5. 支持真实 URDF 物理渲染的 3D 视图引擎
+// 6. 支持真实 URDF 物理渲染的 3D 视图引擎
 // ==========================================
 const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentFrame, currentState, isPlaying, selectedBones, onSelectBone, robotData, fileMap, theme }, ref) => {
   const containerRef = useRef(null);
@@ -1478,9 +1608,12 @@ const Viewport3D = forwardRef(({ mode, selType, space, ikMode, showCoM, currentF
 });
 
 // ==========================================
-// 6. 主应用与状态统筹
+// 7. 主应用与状态统筹
 // ==========================================
 export default function App() {
+  const [lang, setLang] = useState('zh');
+  const t = useCallback((key) => i18nDict[lang][key] || key, [lang]);
+
   const [theme, setTheme] = useState('dark'); 
 
   const [mode, setMode] = useState('rotate'); 
@@ -1552,7 +1685,7 @@ export default function App() {
     const files = Array.from(event.target.files);
     if (files.length === 0) return;
     const urdfFiles = files.filter(f => f.name.toLowerCase().endsWith('.urdf'));
-    if (urdfFiles.length === 0) { alert("没有找到 .urdf 文件！"); return; }
+    if (urdfFiles.length === 0) { alert(t('noURDF')); return; }
     if (urdfFiles.length === 1) loadSelectedURDF(urdfFiles[0], files);
     else { setAvailableURDFs(urdfFiles); setPendingFiles(files); setIsURDFModalOpen(true); }
     event.target.value = '';
@@ -1571,7 +1704,7 @@ export default function App() {
         setFileMap(newFileMap); setRobotData(newRobotData); setActiveJoints(allTimelineBones);
         if (allTimelineBones.length > 0) setSelectedBones([allTimelineBones[0]]);
         setKeyframes({}); setCurrentFrame(0);
-    } catch (error) { alert("URDF 解析失败！"); }
+    } catch (error) { alert(t('urdfFailed')); }
   };
 
   const visibleJoints = useMemo(() => {
@@ -1748,7 +1881,7 @@ export default function App() {
 
   const handleExportCSV = async () => {
     if (!robotData) return;
-    setProgressTask({ title: "初始化导出任务...", percent: 0 });
+    setProgressTask({ title: t('initExport'), percent: 0 });
     await new Promise(r => setTimeout(r, 50));
 
     const csvHeaders = ["x", "y", "z", "qx", "qy", "qz", "qw"];
@@ -1783,7 +1916,7 @@ export default function App() {
       csvContent += row + "\n";
 
       if (f % 50 === 0) {
-          setProgressTask({ title: `正在生成 CSV 数据 (${f}/${totalFrames})...`, percent: Math.round((f / totalFrames) * 100) });
+          setProgressTask({ title: `${t('generatingCSV')} (${f}/${totalFrames})...`, percent: Math.round((f / totalFrames) * 100) });
           await new Promise(r => setTimeout(r, 0));
       }
     }
@@ -1798,13 +1931,13 @@ export default function App() {
     const file = event.target.files[0];
     if (!file) return;
     
-    setProgressTask({ title: "读取并解析 CSV 文件...", percent: 0 });
+    setProgressTask({ title: t('readParseCSV'), percent: 0 });
     await new Promise(r => setTimeout(r, 50));
 
     try {
         const text = await file.text();
         const lines = text.trim().split('\n');
-        if (lines.length < 2) throw new Error("CSV格式错误或文件过短");
+        if (lines.length < 2) throw new Error(t('csvFormatErr'));
         
         const headers = lines[0].split(',').map(s => s.trim());
         let startIndex = 1;
@@ -1855,7 +1988,7 @@ export default function App() {
           });
 
           if (i % 100 === 0) {
-              setProgressTask({ title: `正在重组姿态轨道 (${i}/${dataLines.length})...`, percent: Math.round((i / dataLines.length) * 100) });
+              setProgressTask({ title: `${t('rebuildMatrix')} (${i}/${dataLines.length})...`, percent: Math.round((i / dataLines.length) * 100) });
               await new Promise(r => setTimeout(r, 0));
           }
         }
@@ -1863,7 +1996,7 @@ export default function App() {
         setCurrentFrame(0);
     } catch (e) {
         console.error(e);
-        alert("导入失败: " + e.message);
+        alert(t('importFailed') + " " + e.message);
     } finally {
         setProgressTask(null);
         event.target.value = '';
@@ -1894,22 +2027,26 @@ export default function App() {
       )}
 
       <div className="absolute top-4 left-4 z-20 flex gap-2">
+         <a href="https://github.com/blogdefotsec/MMMimic-Studio" target="_blank" rel="noopener noreferrer" className="flex items-center gap-1.5 px-3 py-1.5 bg-[#2b3137] hover:bg-[#3f4448] text-white text-[11px] font-bold rounded shadow-lg cursor-pointer transition-colors border border-[#1e2327] no-underline">
+            <span className="text-sm leading-none">★</span> {t('tutorialRepo')}
+         </a>
+
          <label className="flex items-center gap-1.5 px-3 py-1.5 bg-[#007acc] hover:bg-[#0098ff] text-white text-[11px] font-bold rounded shadow-lg cursor-pointer transition-colors border border-[#0055aa]">
-            <span>📂</span> 导入 URDF 文件夹
+            {t('importURDF')}
             <input type="file" webkitdirectory="" directory="" multiple className="hidden" onChange={handleFolderUpload} />
          </label>
          
          {robotData && (
            <>
              <label className="flex items-center gap-1.5 px-3 py-1.5 bg-[#2ea043] hover:bg-[#3fb950] text-white text-[11px] font-bold rounded shadow-lg cursor-pointer transition-colors border border-[#238636]">
-                <span>📥</span> 导入 CSV
+                {t('importCSV')}
                 <input type="file" accept=".csv" className="hidden" onChange={handleImportCSV} />
              </label>
              <button onClick={handleExportCSV} className="flex items-center gap-1.5 px-3 py-1.5 bg-[#2ea043] hover:bg-[#3fb950] text-white text-[11px] font-bold rounded shadow-lg cursor-pointer transition-colors border border-[#238636]">
-                <span>📤</span> 导出 CSV
+                {t('exportCSV')}
              </button>
              <div className="flex items-center text-[10px] text-[var(--text-main)] bg-[var(--bg-panel)] px-2 rounded border border-[var(--border)] shadow-sm">
-                载入: {robotData.name}
+                {t('loaded')}: {robotData.name}
              </div>
            </>
          )}
@@ -1918,8 +2055,8 @@ export default function App() {
       {isURDFModalOpen && (
         <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
           <div className="bg-[var(--bg-panel)] border border-[var(--border)] p-5 rounded shadow-2xl w-80 flex flex-col gap-4 max-h-[80vh]">
-             <h3 className="text-sm font-bold text-[var(--text-highlight)]">检测到多个 URDF 文件</h3>
-             <p className="text-xs text-[var(--text-muted)]">请选择要加载的模型：</p>
+             <h3 className="text-sm font-bold text-[var(--text-highlight)]">{t('multiURDFDetected')}</h3>
+             <p className="text-xs text-[var(--text-muted)]">{t('selectModel')}</p>
              <div className="flex-1 overflow-y-auto border border-[var(--border)] rounded p-1 bg-[var(--bg-main)] flex flex-col gap-1 max-h-[40vh]">
                  {availableURDFs.map((file, idx) => (
                      <button key={idx} onClick={() => loadSelectedURDF(file, pendingFiles)} className="w-full text-left px-3 py-2 text-xs text-[var(--text-main)] hover:bg-[#007acc] hover:text-white rounded transition-colors break-all">
@@ -1928,7 +2065,7 @@ export default function App() {
                  ))}
              </div>
              <div className="flex justify-end gap-2 mt-2">
-               <button onClick={() => { setIsURDFModalOpen(false); setPendingFiles([]); }} className="px-3 py-1 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] border border-[var(--border)] rounded text-xs transition-colors">取消</button>
+               <button onClick={() => { setIsURDFModalOpen(false); setPendingFiles([]); }} className="px-3 py-1 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] border border-[var(--border)] rounded text-xs transition-colors">{t('cancel')}</button>
              </div>
           </div>
         </div>
@@ -1937,11 +2074,11 @@ export default function App() {
       {isFramesModalOpen && (
         <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
           <div className="bg-[var(--bg-panel)] border border-[var(--border)] p-5 rounded shadow-2xl w-64 flex flex-col gap-4">
-             <h3 className="text-sm font-bold text-[var(--text-highlight)]">设置总帧数</h3>
+             <h3 className="text-sm font-bold text-[var(--text-highlight)]">{t('setTotalFramesTitle')}</h3>
              <input type="number" autoFocus min={10} value={tempFramesInput} onChange={(e) => setTempFramesInput(e.target.value)} className="bg-[var(--bg-main)] border border-[var(--border)] text-[var(--text-main)] p-1.5 rounded outline-none focus:border-[#007acc] w-full" />
              <div className="flex justify-end gap-2 mt-2">
-               <button onClick={() => setIsFramesModalOpen(false)} className="px-3 py-1 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] border border-[var(--border)] rounded text-xs transition-colors">取消</button>
-               <button onClick={() => { const val = Math.max(10, parseInt(tempFramesInput) || 60); setTotalFrames(val); setIsFramesModalOpen(false); }} className="px-3 py-1 bg-[#007acc] hover:bg-[#0098ff] text-white rounded text-xs transition-colors">确定</button>
+               <button onClick={() => setIsFramesModalOpen(false)} className="px-3 py-1 bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] border border-[var(--border)] rounded text-xs transition-colors">{t('cancel')}</button>
+               <button onClick={() => { const val = Math.max(10, parseInt(tempFramesInput) || 60); setTotalFrames(val); setIsFramesModalOpen(false); }} className="px-3 py-1 bg-[#007acc] hover:bg-[#0098ff] text-white rounded text-xs transition-colors">{t('confirm')}</button>
              </div>
           </div>
         </div>
@@ -1960,22 +2097,23 @@ export default function App() {
            isPlaying={isPlaying} setIsPlaying={setIsPlaying} onStart={() => setCurrentFrame(0)} onEnd={() => setCurrentFrame(totalFrames)}
            onPrevKey={() => { const frames = getAllKeyframeNums(); const prev = frames.reverse().find(f => f < currentFrame); setCurrentFrame(prev !== undefined ? prev : 0); }}
            onNextKey={() => { const frames = getAllKeyframeNums(); const next = frames.find(f => f > currentFrame); setCurrentFrame(next !== undefined ? next : totalFrames); }}
+           t={t}
         />
         
         <div className="flex-1 flex flex-col bg-[var(--bg-main)] border-t-2 border-[var(--border)] min-h-[220px]">
             <div className="h-[32px] bg-[var(--bg-header)] px-3 text-xs font-bold border-b border-[var(--border)] flex items-center gap-4 shrink-0">
-                <button onClick={() => setBottomTab('curve')} className={`h-full px-2 transition-colors ${bottomTab === 'curve' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}>插值曲线</button>
+                <button onClick={() => setBottomTab('curve')} className={`h-full px-2 transition-colors ${bottomTab === 'curve' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}>{t('curveEditor')}</button>
                 <button onClick={() => setBottomTab('clean')} className={`h-full px-2 transition-colors flex items-center gap-1 ${bottomTab === 'clean' ? 'text-[var(--accent)] border-b-2 border-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}>
-                    🛠 数据清洗
+                    {t('dataCleaning')}
                 </button>
             </div>
             
             {bottomTab === 'curve' ? (
-                <CurveEditor curve={currentActiveCurve} theme={theme} onChange={(c) => { if(!activeKey) return; setKeyframes(prev => { const nd = {...prev}; selectedBones.forEach(b => { if(nd[b] && nd[b][activeKey.frame]) nd[b][activeKey.frame].c = c; }); return nd; }); }} disabled={!activeKey || activeKey.frame === 0} />
+                <CurveEditor curve={currentActiveCurve} theme={theme} t={t} onChange={(c) => { if(!activeKey) return; setKeyframes(prev => { const nd = { ...prev }; selectedBones.forEach(b => { if(nd[b] && nd[b][activeKey.frame]) nd[b][activeKey.frame].c = c; }); return nd; }); }} disabled={!activeKey || activeKey.frame === 0} />
             ) : (
                 <DataCleaningPanel 
                     robotData={robotData} activeJoints={activeJoints} visibleJoints={visibleJoints} selectedBones={selectedBones} currentFrame={currentFrame} keyframes={keyframes} selectionBox={selectionBox} 
-                    totalFrames={totalFrames} setKeyframes={setKeyframes} setProgressTask={setProgressTask} theme={theme} 
+                    totalFrames={totalFrames} setKeyframes={setKeyframes} setProgressTask={setProgressTask} theme={theme} t={t}
                 />
             )}
         </div>
@@ -1984,31 +2122,34 @@ export default function App() {
       <div className="flex-1 flex flex-col relative bg-[var(--bg-main)]">
         <div className="absolute top-4 right-4 bg-[var(--bg-panel)] p-1.5 border border-[var(--border)] text-[var(--text-main)] text-[11px] font-sans w-[250px] shadow-lg z-20 flex flex-col gap-1.5 rounded">
           <div className="flex justify-between gap-1 h-6">
-             <button onClick={() => setMode('select')} className={`flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] transition-colors ${mode==='select'?'!bg-[var(--accent)] text-white':''}`}>选中</button>
-             <button onClick={() => setMode('rotate')} className={`flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] transition-colors ${mode==='rotate'?'!bg-[var(--accent)] text-white':''}`}>旋转</button>
-             <button onClick={() => setMode('move')} className={`flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] transition-colors ${mode==='move'?'!bg-[var(--accent)] text-white':''}`}>移动</button>
+             <button onClick={() => setMode('select')} className={`flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] transition-colors ${mode==='select'?'!bg-[var(--accent)] text-white':''}`}>{t('select')}</button>
+             <button onClick={() => setMode('rotate')} className={`flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] transition-colors ${mode==='rotate'?'!bg-[var(--accent)] text-white':''}`}>{t('rotate')}</button>
+             <button onClick={() => setMode('move')} className={`flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] transition-colors ${mode==='move'?'!bg-[var(--accent)] text-white':''}`}>{t('move')}</button>
           </div>
           <div className="flex justify-between gap-1 h-6">
-             <button onClick={() => { if(mode==='select') setSelType('box') }} className={`flex-1 border border-[var(--border)] transition-colors ${mode!=='select' ? 'bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed' : (selType==='box' ? '!bg-[var(--accent)] text-white' : 'bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]')}`}>框选</button>
-             <button onClick={selectAll} className={`flex-1 border border-[var(--border)] transition-colors ${mode!=='select' ? 'bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed' : 'bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] active:bg-[var(--accent)]'}`}>选择全部</button>
-             <button onClick={() => { if(mode==='select') setSelType('free') }} className={`flex-1 border border-[var(--border)] transition-colors ${mode!=='select' ? 'bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed' : (selType==='free' ? '!bg-[var(--accent)] text-white' : 'bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]')}`}>自由选择</button>
+             <button onClick={() => { if(mode==='select') setSelType('box') }} className={`flex-1 border border-[var(--border)] transition-colors ${mode!=='select' ? 'bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed' : (selType==='box' ? '!bg-[var(--accent)] text-white' : 'bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]')}`}>{t('boxSelMode')}</button>
+             <button onClick={selectAll} className={`flex-1 border border-[var(--border)] transition-colors ${mode!=='select' ? 'bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed' : 'bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] active:bg-[var(--accent)]'}`}>{t('selectAll')}</button>
+             <button onClick={() => { if(mode==='select') setSelType('free') }} className={`flex-1 border border-[var(--border)] transition-colors ${mode!=='select' ? 'bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed' : (selType==='free' ? '!bg-[var(--accent)] text-white' : 'bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]')}`}>{t('freeSelect')}</button>
           </div>
           <div className="flex justify-between gap-1 h-6">
-             <button onClick={handleRegisterKeyframe} className="flex-[2] border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[#e55353] font-bold tracking-widest">注册</button>
-             <button onClick={handleReset} className="flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]">重置</button>
-             <button className="flex-1 border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed">物理</button>
+             <button onClick={handleRegisterKeyframe} className="flex-[2] border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)] text-[#e55353] font-bold tracking-widest">{t('register')}</button>
+             <button onClick={handleReset} className="flex-1 border border-[var(--border)] bg-[var(--bg-btn)] hover:bg-[var(--bg-btn-hover)]">{t('reset')}</button>
+             <button className="flex-1 border border-[var(--border)] bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-not-allowed">{t('physics')}</button>
           </div>
           <div className="text-center mt-0.5 font-bold text-[10px] text-[var(--text-muted)] border-t border-[var(--border)] pt-1 tracking-widest flex justify-between items-center px-1">
-            <span>操作设置</span>
+            <span>{t('opSettings')}</span>
             <div className="flex gap-1">
+               <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setLang(l => l==='zh'?'en':'zh')} title="Language / 语言">
+                   {lang === 'zh' ? 'EN' : '中'}
+               </span>
                <span className="font-normal text-[10px] cursor-pointer hover:scale-110 transition-transform" onClick={()=>setTheme(t => t==='dark'?'light':'dark')} title="切换日夜模式">
                    {theme==='dark'?'🌞':'🌙'}
                </span>
-               <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setShowCoM(s => !s)} title="显示/隐藏整机质心">
-                   质心: {showCoM?'开':'关'}
+               <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setShowCoM(s => !s)}>
+                   {t('com')} {showCoM ? t('on') : t('off')}
                </span>
-               <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setIkMode(m => m==='global'?'selected':'global')} title="全局: IK追溯至根节点&#10;选中: IK仅在已框选的关节之间起效">
-                   IK: {ikMode==='global'?'链式':'局部'}
+               <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setIkMode(m => m==='global'?'selected':'global')} title={t('ikHover')}>
+                   IK: {ikMode==='global' ? t('ikGlobal') : t('ikLocal')}
                </span>
                <span className="font-normal text-[9px] bg-[var(--bg-hover)] px-1 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--border)] shadow-sm" onClick={()=>setSpace(s => s==='local'?'world':'local')}>
                    {space.toUpperCase()}
